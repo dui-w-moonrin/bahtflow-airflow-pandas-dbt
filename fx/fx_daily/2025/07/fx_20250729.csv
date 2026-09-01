@@ -1,0 +1,3 @@
+rate_date,currency,mid_rate,rate_unit,source_provider,source_url
+2025-07-29,EUR,37.6059,THB per 1 EUR,BOT via Frankfurter,https://api.frankfurter.dev/v2/rates?base=EUR&quotes=THB&from=2025-07-08&to=2026-07-21&providers=BOT
+2025-07-29,USD,32.4746,THB per 1 USD,BOT via Frankfurter,https://api.frankfurter.dev/v2/rates?base=USD&quotes=THB&from=2025-07-08&to=2026-07-21&providers=BOT
