@@ -17,7 +17,9 @@ Add a local Apache Airflow 3 runtime on top of the Docker foundation created in 
 - Metadata database connection: the existing local `bahtflow` PostgreSQL database and credentials supplied through `.env`.
 - Auth manager: Airflow 3 default SimpleAuthManager.
 - Local authentication mode: `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=True`; this is explicitly development-only.
-- API/UI port: `8080`.
+- API/UI host URL: `http://localhost:8080`.
+- Internal Execution API URL: `http://airflow-api-server:8080/execution/`.
+- DAG/business timezone: `Asia/Bangkok`.
 - Airflow configuration is supplied through environment variables rather than a committed runtime `airflow.cfg`.
 
 The Airflow image is pinned to Python 3.12 to match the existing Feature 00 toolbox runtime and avoid accidental Python-version drift while later Python/Pandas dependencies are introduced.
@@ -40,7 +42,7 @@ postgres
    +-- toolbox
    |
    +-- airflow-init          # one-shot metadata migration
-   +-- airflow-api-server    # UI + public API on localhost:8080
+   +-- airflow-api-server    # UI + Core/Execution APIs on localhost:8080
    +-- airflow-scheduler     # scheduling + LocalExecutor task execution
    +-- airflow-dag-processor # DAG parsing/serialization
 ```
@@ -61,7 +63,11 @@ AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://<user>:<password>@post
 AIRFLOW__CORE__LOAD_EXAMPLES=False
 AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=True
 AIRFLOW__API__BASE_URL=http://localhost:8080
+AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://airflow-api-server:8080/execution/
+AIRFLOW__CORE__DEFAULT_TIMEZONE=Asia/Bangkok
 ```
+
+`AIRFLOW__API__BASE_URL` is the host/browser-facing URL. The Execution API setting deliberately uses the Docker service hostname because tasks launched by LocalExecutor run inside the Airflow container network; `localhost:8080` from that context would refer to the wrong container/process.
 
 The database connection string is composed from environment values already represented in `.env.example`; no real secret is committed.
 
@@ -140,16 +146,17 @@ Task IDs are part of the orchestration contract and are retained by later featur
 
 ## Scheduling and Backfill Contract
 
-The DAG uses a daily timetable but does not automatically create the full historical backlog when the scheduler first starts.
-
-Design:
+The DAG uses:
 
 ```text
-schedule = daily
+schedule = "@daily"
 catchup = False
+start_date = 2025-07-22 00:00:00 Asia/Bangkok
 ```
 
-Historical execution is explicit through the Airflow 3 backfill command. Feature 01 proves the mechanism with only three dates:
+`Asia/Bangkok` is intentional: later transaction paths are keyed by Thai business date, so Airflow's data interval must align with that date rather than rely on an implicit UTC boundary.
+
+The scheduler does not automatically create the full historical backlog when first started. Historical execution is explicit through the Airflow 3 backfill command. Feature 01 proves the mechanism with only three dates:
 
 ```text
 2025-07-22
@@ -201,7 +208,7 @@ Import the DAG in an Airflow-enabled test environment and assert:
 - DAG ID is `bahtflow_daily`.
 - expected task IDs are present exactly once;
 - no unexpected real operators or external-system dependencies are introduced;
-- schedule is daily and automatic catchup is disabled.
+- schedule is `@daily`, automatic catchup is disabled, and timezone-aware start date is Asia/Bangkok.
 
 ### Dependency test
 
