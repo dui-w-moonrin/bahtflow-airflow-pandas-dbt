@@ -47,3 +47,17 @@ For local checks, direct pytest to a repository-local temporary directory:
 ```powershell
 python -m pytest tests -v --basetemp .pytest_tmp
 ```
+
+## Local Docker environment
+
+F00 provides a local-only Docker environment. Airflow, GCP, BigQuery, and dbt
+are intentionally deferred to later features.
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build
+docker compose ps
+docker compose exec postgres pg_isready -U bahtflow -d bahtflow
+docker compose exec toolbox python --version
+docker compose down
+```
