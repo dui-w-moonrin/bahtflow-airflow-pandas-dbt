@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bahtflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  toolbox:
+    build:
+      context: .
+      dockerfile: docker/toolbox.Dockerfile
+    working_dir: /opt/bahtflow
+    volumes:
+      - ./:/opt/bahtflow
+    networks:
+      - bahtflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  bahtflow:
+    name: ${COMPOSE_PROJECT_NAME}_network
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME}_postgres_data
