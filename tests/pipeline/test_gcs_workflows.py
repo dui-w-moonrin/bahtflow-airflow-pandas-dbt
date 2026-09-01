@@ -93,3 +93,21 @@ def test_smoke_upload_selects_one_txn_one_fx_and_both_manifests(tmp_path):
         "manifests/fx_manifest.csv",
         "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz",
     ]
+
+
+def test_bootstrap_cli_requires_exactly_one_mode():
+    from scripts.bootstrap_gcs import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+    assert parser.parse_args(["--check-only"]).check_only is True
+    assert parser.parse_args(["--create-if-missing"]).create_if_missing is True
+
+
+def test_upload_cli_supports_smoke_flag():
+    from scripts.upload_landing_sources import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args([]).smoke is False
+    assert parser.parse_args(["--smoke"]).smoke is True

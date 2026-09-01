@@ -51,6 +51,27 @@ services:
       postgres:
         condition: service_healthy
 
+  gcp-toolbox:
+    build:
+      context: .
+      dockerfile: docker/toolbox.Dockerfile
+    profiles: ["gcp"]
+    working_dir: /opt/bahtflow
+    environment:
+      BAHTFLOW_GCP_PROJECT: ${BAHTFLOW_GCP_PROJECT}
+      BAHTFLOW_GCS_BUCKET: ${BAHTFLOW_GCS_BUCKET}
+      BAHTFLOW_GCP_LOCATION: ${BAHTFLOW_GCP_LOCATION}
+      BAHTFLOW_RUNTIME_SERVICE_ACCOUNT: ${BAHTFLOW_RUNTIME_SERVICE_ACCOUNT}
+      GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/application_default_credentials.json
+    volumes:
+      - ./:/opt/bahtflow
+      - type: bind
+        source: ${GOOGLE_ADC_HOST_PATH}
+        target: /var/secrets/google/application_default_credentials.json
+        read_only: true
+    networks:
+      - bahtflow
+
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
