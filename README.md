@@ -4,7 +4,9 @@ BahtFlow is a production-minded batch ELT portfolio project for practising the d
 
 ## Current phase
 
-This first release contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A`. Those records are evidence that later Pandas and dbt stages must classify, quarantine, test, and document data rather than silently discard it.
+The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A`. Those records are evidence that later Pandas and dbt stages must classify, quarantine, test, and document data rather than silently discard it.
+
+Feature 01 adds the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. GCS, BigQuery, Pandas ingestion, dbt transformation, and real data-quality behavior remain later features.
 
 Read the [data contract](data/README.md) for the source layout and validation manifest. The fuller architecture is in [the design specification](docs/superpowers/specs/2026-09-01-bahtflow-airflow-pandas-dbt-design.md).
 
@@ -26,7 +28,7 @@ GCS immutable landing --> BigQuery raw append-only tables
                          dbt staging / quarantine / marts
 ```
 
-Airflow, Pandas checks, Google Cloud loading, and dbt models are intentionally delivered in later phases. Starting with a fixed, auditable source lets each subsequent component be developed and tested against the same data contract.
+Starting with a fixed, auditable source lets each subsequent component be developed and tested against the same data contract.
 
 ## Reproduce the source corpus
 
@@ -50,8 +52,7 @@ python -m pytest tests -v --basetemp .pytest_tmp
 
 ## Local Docker environment
 
-F00 provides a local-only Docker environment. Airflow, GCP, BigQuery, and dbt
-are intentionally deferred to later features.
+Feature 00 provides the shared PostgreSQL and toolbox foundation.
 
 ```powershell
 Copy-Item .env.example .env
@@ -59,5 +60,78 @@ docker compose up -d --build
 docker compose ps
 docker compose exec postgres pg_isready -U bahtflow -d bahtflow
 docker compose exec toolbox python --version
+docker compose down
+```
+
+`.env` is ignored by Git. Values in `.env.example` are local-development defaults only.
+
+## Airflow 3 orchestration skeleton
+
+Feature 01 runs Apache Airflow `3.3.1` with LocalExecutor, the existing PostgreSQL metadata backend, a separate DAG processor, and the API server on `http://localhost:8080`.
+
+The SimpleAuthManager all-admin setting and example API/JWT secrets are intentionally local-development settings. Do not reuse them for a shared or production deployment.
+
+Initialize the metadata schema:
+
+```powershell
+docker compose up airflow-init
+```
+
+Start the Airflow components:
+
+```powershell
+docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
+docker compose ps
+```
+
+Verify the runtime and DAG discovery:
+
+```powershell
+docker compose exec airflow-scheduler airflow version
+docker compose exec airflow-scheduler airflow config get-value core executor
+docker compose exec airflow-scheduler airflow dags list
+docker compose exec airflow-scheduler airflow dags list-import-errors
+```
+
+Expected runtime values are Airflow `3.3.1` and `LocalExecutor`, with `bahtflow_daily` visible and no import errors.
+
+Check the API health endpoint from PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:8080/api/v2/monitor/health
+```
+
+Run one isolated logical-date smoke test outside the bounded backfill window:
+
+```powershell
+docker compose exec airflow-scheduler `
+  airflow dags test bahtflow_daily 2025-07-25 --use-executor
+```
+
+Create the Feature 01 three-date backfill:
+
+```powershell
+docker compose exec airflow-scheduler `
+  airflow backfill create `
+    --dag-id bahtflow_daily `
+    --from-date 2025-07-22 `
+    --to-date 2025-07-24 `
+    --max-active-runs 2
+```
+
+Inspect the resulting DAG runs:
+
+```powershell
+docker compose exec airflow-scheduler `
+  airflow dags list-runs bahtflow_daily `
+    --start-date 2025-07-22 `
+    --end-date 2025-07-24
+```
+
+The DAG is intentionally all `EmptyOperator` tasks in Feature 01. It proves orchestration shape, Airflow 3 component wiring, logical-date execution, and explicit backfill only; it does not access GCS, BigQuery, Pandas, or dbt.
+
+Stop the local environment when finished:
+
+```powershell
 docker compose down
 ```
