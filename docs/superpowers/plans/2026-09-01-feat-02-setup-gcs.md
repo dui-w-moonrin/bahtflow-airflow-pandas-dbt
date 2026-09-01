@@ -4,7 +4,7 @@
 
 **Goal:** Add a credential-safe, idempotent local-to-GCS landing boundary that uses ADC with service-account impersonation and rejects conflicting source objects by SHA-256.
 
-**Architecture:** Keep source-path/checksum decisions as pure Python, place Google Cloud Storage calls behind one thin adapter, and keep CLI scripts as orchestration wrappers. Automated tests remain credential-free; live GCP verification is performed separately from Dui's machine with ADC mounted read-only into a dedicated Docker `gcp-toolbox` service.
+**Architecture:** Keep source-path/checksum decisions as pure Python, place Google Cloud Storage calls behind one thin adapter, and keep CLI scripts as orchestration wrappers. Automated tests remain credential-free; live GCP verification runs from Dui's machine with ADC mounted read-only into a dedicated Docker `gcp-toolbox` service.
 
 **Tech Stack:** Python 3.12, `google-cloud-storage==3.13.1`, Google Application Default Credentials, Google Cloud Storage, Docker Compose, pytest.
 
@@ -28,8 +28,6 @@
 
 ## File Structure
 
-Create or modify these files only as needed by this plan:
-
 ```text
 Modify:
   .env.example
@@ -47,6 +45,7 @@ Create:
   pipeline/gcs_workflows.py
   scripts/bootstrap_gcs.py
   scripts/upload_landing_sources.py
+  scripts/verify_gcs_live.py
   tests/pipeline/test_config.py
   tests/pipeline/test_gcs_landing.py
   tests/pipeline/test_gcs_workflows.py
@@ -55,12 +54,13 @@ Create:
 Responsibilities:
 
 - `pipeline/config.py`: parse and validate F02 environment settings only.
-- `pipeline/gcs_landing.py`: pure source discovery, object-name mapping, SHA-256, immutable upload decision.
-- `pipeline/gcs_adapter.py`: thin Google SDK wrapper; no source-contract decisions.
-- `pipeline/gcs_workflows.py`: compose pure landing rules with a storage adapter; test with a fake adapter.
-- `scripts/bootstrap_gcs.py`: CLI for admin/bootstrap bucket create-or-verify.
-- `scripts/upload_landing_sources.py`: CLI for runtime upload; supports bounded `--smoke` mode and full mode.
-- `gcp-toolbox` Compose service: only container in F02 that receives the ADC bind mount.
+- `pipeline/gcs_landing.py`: pure source discovery, canonical object names, SHA-256, immutable upload decision.
+- `pipeline/gcs_adapter.py`: narrow Google SDK wrapper; no source-contract decisions.
+- `pipeline/gcs_workflows.py`: combine pure landing rules with the adapter; unit-test with a fake adapter.
+- `scripts/bootstrap_gcs.py`: admin/bootstrap bucket create-or-verify CLI.
+- `scripts/upload_landing_sources.py`: runtime landing upload CLI with bounded `--smoke` mode.
+- `scripts/verify_gcs_live.py`: live read/checksum/conflict proof using a disposable object.
+- `gcp-toolbox`: the only F02 Compose service that receives the ADC bind mount.
 
 ---
 
@@ -75,10 +75,10 @@ Responsibilities:
 - Modify: `.env.example`
 
 **Interfaces:**
-- Consumes: process environment variables.
-- Produces: `GcpSettings(project_id: str, bucket_name: str, location: str, runtime_service_account: str)` and `load_gcp_settings(env: Mapping[str, str] | None = None) -> GcpSettings`.
+- Produces `GcpSettings(project_id: str, bucket_name: str, location: str, runtime_service_account: str)`.
+- Produces `load_gcp_settings(env: Mapping[str, str] | None = None) -> GcpSettings`.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [ ] **Step 1: Write failing config tests**
 
 Create `tests/pipeline/test_config.py`:
 
@@ -97,9 +97,7 @@ VALID_ENV = {
 
 
 def test_load_gcp_settings_returns_validated_settings():
-    settings = load_gcp_settings(VALID_ENV)
-
-    assert settings == GcpSettings(
+    assert load_gcp_settings(VALID_ENV) == GcpSettings(
         project_id="bahtflow-dev",
         bucket_name="bahtflow-dev-landing",
         location="asia-southeast1",
@@ -111,29 +109,24 @@ def test_load_gcp_settings_returns_validated_settings():
 def test_load_gcp_settings_rejects_missing_required_values(missing_key):
     env = VALID_ENV.copy()
     env.pop(missing_key)
-
     with pytest.raises(GcpConfigError, match=missing_key):
         load_gcp_settings(env)
 
 
 def test_load_gcp_settings_rejects_blank_values():
-    env = VALID_ENV | {"BAHTFLOW_GCS_BUCKET": "   "}
-
     with pytest.raises(GcpConfigError, match="BAHTFLOW_GCS_BUCKET"):
-        load_gcp_settings(env)
+        load_gcp_settings(VALID_ENV | {"BAHTFLOW_GCS_BUCKET": "   "})
 ```
 
-- [ ] **Step 2: Run the focused tests to prove RED**
-
-Run:
+- [ ] **Step 2: Run RED**
 
 ```powershell
 python -m pytest tests/pipeline/test_config.py -v
 ```
 
-Expected: collection/import failure because `pipeline.config` does not exist yet.
+Expected: import/collection failure because `pipeline.config` does not exist.
 
-- [ ] **Step 3: Add the pinned GCS dependency and toolbox installation**
+- [ ] **Step 3: Add reproducible GCS dependency and toolbox install**
 
 Create `requirements-gcp.txt`:
 
@@ -141,7 +134,7 @@ Create `requirements-gcp.txt`:
 google-cloud-storage==3.13.1
 ```
 
-Update `docker/toolbox.Dockerfile` to:
+Update `docker/toolbox.Dockerfile`:
 
 ```dockerfile
 FROM python:3.12-slim
@@ -157,9 +150,9 @@ RUN pip install --no-cache-dir -r /tmp/requirements-gcp.txt
 CMD ["sleep", "infinity"]
 ```
 
-Create an empty `pipeline/__init__.py`.
+Create empty `pipeline/__init__.py`.
 
-- [ ] **Step 4: Implement minimal central config**
+- [ ] **Step 4: Implement config**
 
 Create `pipeline/config.py`:
 
@@ -194,19 +187,17 @@ _REQUIRED_ENV = {
 def load_gcp_settings(env: Mapping[str, str] | None = None) -> GcpSettings:
     source = os.environ if env is None else env
     values: dict[str, str] = {}
-
     for env_name, field_name in _REQUIRED_ENV.items():
         raw = source.get(env_name)
         if raw is None or not raw.strip():
             raise GcpConfigError(f"Missing or blank required setting: {env_name}")
         values[field_name] = raw.strip()
-
     return GcpSettings(**values)
 ```
 
-- [ ] **Step 5: Extend `.env.example` with safe F02 configuration names**
+- [ ] **Step 5: Extend `.env.example`**
 
-Append:
+Append only safe examples:
 
 ```text
 BAHTFLOW_GCP_PROJECT=your-gcp-project-id
@@ -216,20 +207,16 @@ BAHTFLOW_RUNTIME_SERVICE_ACCOUNT=bahtflow-runtime@your-gcp-project-id.iam.gservi
 GOOGLE_ADC_HOST_PATH=C:/Users/YOUR_USER/AppData/Roaming/gcloud/application_default_credentials.json
 ```
 
-Do not put any actual user/project credential into the committed file.
-
-- [ ] **Step 6: Run tests and static config checks**
-
-Run:
+- [ ] **Step 6: Verify GREEN**
 
 ```powershell
 python -m pytest tests/pipeline/test_config.py -v
 python -m py_compile pipeline/config.py
 ```
 
-Expected: all configuration tests PASS and compile exits 0.
+Expected: all tests pass; compile exits 0.
 
-- [ ] **Step 7: Commit Task 1**
+- [ ] **Step 7: Commit**
 
 ```powershell
 git add requirements-gcp.txt pipeline/__init__.py pipeline/config.py tests/pipeline/test_config.py docker/toolbox.Dockerfile .env.example
@@ -238,117 +225,85 @@ git commit -m "feat: add GCP runtime configuration"
 
 ---
 
-### Task 2: Pure Landing Path, Source Discovery, and SHA-256 Contract
+### Task 2: Pure Landing Contract
 
 **Files:**
 - Create: `pipeline/gcs_landing.py`
 - Create: `tests/pipeline/test_gcs_landing.py`
 
 **Interfaces:**
-- Consumes: repository root `Path`, local source `Path`, and remote metadata mappings.
-- Produces:
-  - `SOURCE_SHA256_METADATA_KEY = "bahtflow-source-sha256"`
-  - `LandingConflictError`
-  - `UploadAction` enum with `UPLOAD` and `SKIP`
-  - `LandingSource(local_path: Path, object_name: str)`
-  - `sha256_file(path: Path) -> str`
-  - `transaction_object_name(relative_path: str) -> str`
-  - `fx_object_name(relative_path: str) -> str`
-  - `manifest_object_name(local_path: Path) -> str`
-  - `iter_landing_sources(repo_root: Path) -> list[LandingSource]`
-  - `decide_upload(local_sha256: str, *, remote_exists: bool, remote_metadata: Mapping[str, str] | None) -> UploadAction`
+- `SOURCE_SHA256_METADATA_KEY = "bahtflow-source-sha256"`
+- `LandingConflictError`
+- `UploadAction.UPLOAD`, `UploadAction.SKIP`
+- `LandingSource(local_path: Path, object_name: str)`
+- `sha256_file(path: Path) -> str`
+- `transaction_object_name(relative_path: str) -> str`
+- `fx_object_name(relative_path: str) -> str`
+- `manifest_object_name(local_path: Path) -> str`
+- `iter_landing_sources(repo_root: Path) -> list[LandingSource]`
+- `decide_upload(local_sha256: str, *, remote_exists: bool, remote_metadata: Mapping[str, str] | None) -> UploadAction`
 
-- [ ] **Step 1: Write failing pure-logic tests**
+- [ ] **Step 1: Write failing path/checksum/action tests**
 
-Create `tests/pipeline/test_gcs_landing.py`:
+Create `tests/pipeline/test_gcs_landing.py` with tests asserting:
 
 ```python
-import hashlib
-from pathlib import Path
+assert transaction_object_name(
+    "business_date=2025-07-22/sales_bkk_20250722.csv.gz"
+) == "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz"
 
-import pytest
+assert fx_object_name(
+    "fx_daily/2025/07/fx_20250708.csv"
+) == "fx/2025/07/fx_20250708.csv"
 
-from pipeline.gcs_landing import (
-    SOURCE_SHA256_METADATA_KEY,
-    LandingConflictError,
-    UploadAction,
-    decide_upload,
-    fx_object_name,
-    manifest_object_name,
-    sha256_file,
-    transaction_object_name,
-)
+assert manifest_object_name(
+    Path("data/daily_source_manifest.csv")
+) == "manifests/daily_source_manifest.csv"
 
-
-def test_transaction_object_name_preserves_business_date_partition():
-    assert transaction_object_name(
-        "business_date=2025-07-22/sales_bkk_20250722.csv.gz"
-    ) == "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz"
-
-
-def test_fx_object_name_removes_local_fx_daily_prefix():
-    assert fx_object_name(
-        "fx_daily/2025/07/fx_20250708.csv"
-    ) == "fx/2025/07/fx_20250708.csv"
-
-
-@pytest.mark.parametrize(
-    ("local_path", "expected"),
-    [
-        (Path("data/daily_source_manifest.csv"), "manifests/daily_source_manifest.csv"),
-        (Path("fx/manifest.csv"), "manifests/fx_manifest.csv"),
-    ],
-)
-def test_manifest_object_name_maps_known_manifests(local_path, expected):
-    assert manifest_object_name(local_path) == expected
-
-
-def test_sha256_file_hashes_exact_bytes(tmp_path):
-    source = tmp_path / "sample.bin"
-    source.write_bytes(b"raw-bytes\x00\xff")
-
-    assert sha256_file(source) == hashlib.sha256(b"raw-bytes\x00\xff").hexdigest()
-
-
-def test_absent_object_is_uploaded():
-    assert decide_upload(
-        "abc", remote_exists=False, remote_metadata=None
-    ) is UploadAction.UPLOAD
-
-
-def test_matching_remote_checksum_is_skipped():
-    assert decide_upload(
-        "abc",
-        remote_exists=True,
-        remote_metadata={SOURCE_SHA256_METADATA_KEY: "abc"},
-    ) is UploadAction.SKIP
-
-
-def test_conflicting_remote_checksum_fails():
-    with pytest.raises(LandingConflictError, match="checksum mismatch"):
-        decide_upload(
-            "abc",
-            remote_exists=True,
-            remote_metadata={SOURCE_SHA256_METADATA_KEY: "different"},
-        )
-
-
-def test_existing_object_without_checksum_metadata_fails():
-    with pytest.raises(LandingConflictError, match="missing"):
-        decide_upload("abc", remote_exists=True, remote_metadata={})
+assert manifest_object_name(
+    Path("fx/manifest.csv")
+) == "manifests/fx_manifest.csv"
 ```
 
-- [ ] **Step 2: Run focused tests to prove RED**
+Also test:
+
+```python
+source.write_bytes(b"raw-bytes\x00\xff")
+assert sha256_file(source) == hashlib.sha256(b"raw-bytes\x00\xff").hexdigest()
+```
+
+and the exact immutable cases:
+
+```python
+assert decide_upload("abc", remote_exists=False, remote_metadata=None) is UploadAction.UPLOAD
+assert decide_upload(
+    "abc",
+    remote_exists=True,
+    remote_metadata={SOURCE_SHA256_METADATA_KEY: "abc"},
+) is UploadAction.SKIP
+
+with pytest.raises(LandingConflictError, match="checksum mismatch"):
+    decide_upload(
+        "abc",
+        remote_exists=True,
+        remote_metadata={SOURCE_SHA256_METADATA_KEY: "different"},
+    )
+
+with pytest.raises(LandingConflictError, match="missing"):
+    decide_upload("abc", remote_exists=True, remote_metadata={})
+```
+
+- [ ] **Step 2: Run RED**
 
 ```powershell
 python -m pytest tests/pipeline/test_gcs_landing.py -v
 ```
 
-Expected: FAIL because `pipeline.gcs_landing` is not implemented.
+Expected: FAIL because module/functions do not exist.
 
-- [ ] **Step 3: Implement the pure landing primitives**
+- [ ] **Step 3: Implement pure path/checksum/action functions**
 
-Create `pipeline/gcs_landing.py` with these exact public contracts:
+Create `pipeline/gcs_landing.py` with:
 
 ```python
 from __future__ import annotations
@@ -408,15 +363,14 @@ def fx_object_name(relative_path: str) -> str:
 
 
 def manifest_object_name(local_path: Path) -> str:
-    normalized = local_path.as_posix()
     mapping = {
         "data/daily_source_manifest.csv": "manifests/daily_source_manifest.csv",
         "fx/manifest.csv": "manifests/fx_manifest.csv",
     }
-    try:
-        return mapping[normalized]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported manifest path: {normalized}") from exc
+    normalized = local_path.as_posix()
+    if normalized not in mapping:
+        raise ValueError(f"Unsupported manifest path: {normalized}")
+    return mapping[normalized]
 
 
 def decide_upload(
@@ -427,7 +381,6 @@ def decide_upload(
 ) -> UploadAction:
     if not remote_exists:
         return UploadAction.UPLOAD
-
     metadata = remote_metadata or {}
     remote_sha256 = metadata.get(SOURCE_SHA256_METADATA_KEY)
     if not remote_sha256:
@@ -437,19 +390,18 @@ def decide_upload(
     return UploadAction.SKIP
 ```
 
-- [ ] **Step 4: Add source-discovery tests against a tiny fixture tree**
+- [ ] **Step 4: Add deterministic source-discovery tests**
 
-Append tests that create:
+Build a tiny repo fixture containing exactly:
 
 ```text
-repo/
-  data/daily_regional_sales/business_date=2025-07-22/sales_bkk_20250722.csv.gz
-  data/daily_source_manifest.csv
-  fx/fx_daily/2025/07/fx_20250708.csv
-  fx/manifest.csv
+data/daily_regional_sales/business_date=2025-07-22/sales_bkk_20250722.csv.gz
+data/daily_source_manifest.csv
+fx/fx_daily/2025/07/fx_20250708.csv
+fx/manifest.csv
 ```
 
-and assert `iter_landing_sources(repo)` returns canonical object names in sorted order:
+Assert sorted object names are:
 
 ```python
 [
@@ -460,53 +412,61 @@ and assert `iter_landing_sources(repo)` returns canonical object names in sorted
 ]
 ```
 
-- [ ] **Step 5: Implement deterministic source discovery**
+Add two negative tests: missing `data/daily_regional_sales` raises `FileNotFoundError`; missing `fx/fx_daily` raises `FileNotFoundError`.
 
-Add to `pipeline/gcs_landing.py`:
+- [ ] **Step 5: Implement source discovery including explicit root checks**
+
+Add:
 
 ```python
 def iter_landing_sources(repo_root: Path) -> list[LandingSource]:
+    transaction_root = repo_root / "data" / "daily_regional_sales"
+    fx_daily_root = repo_root / "fx" / "fx_daily"
+    if not transaction_root.is_dir():
+        raise FileNotFoundError(transaction_root)
+    if not fx_daily_root.is_dir():
+        raise FileNotFoundError(fx_daily_root)
+
     sources: list[LandingSource] = []
 
-    transaction_root = repo_root / "data" / "daily_regional_sales"
     for path in transaction_root.glob("business_date=*/*.csv.gz"):
         relative = path.relative_to(transaction_root).as_posix()
         sources.append(LandingSource(path, transaction_object_name(relative)))
 
     fx_root = repo_root / "fx"
-    for path in (fx_root / "fx_daily").glob("*/*/fx_*.csv"):
+    for path in fx_daily_root.glob("*/*/fx_*.csv"):
         relative = path.relative_to(fx_root).as_posix()
         sources.append(LandingSource(path, fx_object_name(relative)))
 
-    for path in [repo_root / "data" / "daily_source_manifest.csv", repo_root / "fx" / "manifest.csv"]:
+    manifest_paths = [
+        repo_root / "data" / "daily_source_manifest.csv",
+        repo_root / "fx" / "manifest.csv",
+    ]
+    for path in manifest_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
-        sources.append(LandingSource(path, manifest_object_name(path.relative_to(repo_root))))
+        sources.append(
+            LandingSource(
+                path,
+                manifest_object_name(path.relative_to(repo_root)),
+            )
+        )
 
     return sorted(sources, key=lambda item: item.object_name)
 ```
 
-Also fail explicitly when either transaction root or FX root is missing, so an accidental partial checkout cannot silently produce a partial landing set.
-
-- [ ] **Step 6: Run pure landing tests**
+- [ ] **Step 6: Verify GREEN and commit**
 
 ```powershell
 python -m pytest tests/pipeline/test_gcs_landing.py -v
 python -m py_compile pipeline/gcs_landing.py
-```
-
-Expected: PASS.
-
-- [ ] **Step 7: Commit Task 2**
-
-```powershell
 git add pipeline/gcs_landing.py tests/pipeline/test_gcs_landing.py
 git commit -m "feat: define immutable GCS landing contract"
 ```
 
 ---
 
-### Task 3: Thin GCS Adapter and Credential-Free Workflow Tests
+### Task 3: Thin GCS Adapter and Landing Workflow
 
 **Files:**
 - Create: `pipeline/gcs_adapter.py`
@@ -515,104 +475,31 @@ git commit -m "feat: define immutable GCS landing contract"
 
 **Interfaces:**
 - `ObjectMetadata(exists: bool, metadata: Mapping[str, str])`
-- `GcsAdapter(project_id: str)` methods:
-  - `ensure_bucket(bucket_name: str, location: str, *, create_if_missing: bool) -> str`
-  - `get_object_metadata(bucket_name: str, object_name: str) -> ObjectMetadata`
-  - `upload_file(bucket_name: str, object_name: str, local_path: Path, metadata: Mapping[str, str]) -> None`
-  - `list_object_names(bucket_name: str, prefix: str = "") -> list[str]`
-  - `download_bytes(bucket_name: str, object_name: str) -> bytes`
+- `GcsAdapter.ensure_bucket(...) -> str`
+- `GcsAdapter.get_object_metadata(...) -> ObjectMetadata`
+- `GcsAdapter.upload_file(...) -> None`
+- `GcsAdapter.list_object_names(...) -> list[str]`
+- `GcsAdapter.download_bytes(...) -> bytes`
+- `GcsAdapter.delete_object(...) -> None` only for disposable live verification cleanup.
 - `UploadSummary(uploaded: int, skipped: int)`
 - `upload_sources(repo_root: Path, bucket_name: str, adapter, *, smoke: bool = False) -> UploadSummary`
 
-- [ ] **Step 1: Write workflow tests using a tiny fake adapter**
+- [ ] **Step 1: Write workflow tests with a fake storage adapter**
 
-Create `tests/pipeline/test_gcs_workflows.py`:
+The fake stores object bytes + metadata in memory and implements `get_object_metadata` and `upload_file` only. Test:
 
 ```python
-from pathlib import Path
-
-import pytest
-
-from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY, LandingConflictError
-from pipeline.gcs_workflows import upload_sources
-
-
-class FakeStorage:
-    def __init__(self):
-        self.objects = {}
-        self.upload_calls = []
-
-    def get_object_metadata(self, bucket_name, object_name):
-        from pipeline.gcs_adapter import ObjectMetadata
-
-        value = self.objects.get(object_name)
-        if value is None:
-            return ObjectMetadata(exists=False, metadata={})
-        return ObjectMetadata(exists=True, metadata=value["metadata"])
-
-    def upload_file(self, bucket_name, object_name, local_path, metadata):
-        payload = Path(local_path).read_bytes()
-        self.objects[object_name] = {"bytes": payload, "metadata": dict(metadata)}
-        self.upload_calls.append(object_name)
-
-
-def make_repo(tmp_path):
-    txn = tmp_path / "data/daily_regional_sales/business_date=2025-07-22/sales_bkk_20250722.csv.gz"
-    txn.parent.mkdir(parents=True)
-    txn.write_bytes(b"txn-source")
-
-    tx_manifest = tmp_path / "data/daily_source_manifest.csv"
-    tx_manifest.write_text("header\n", encoding="utf-8")
-
-    fx = tmp_path / "fx/fx_daily/2025/07/fx_20250708.csv"
-    fx.parent.mkdir(parents=True)
-    fx.write_bytes(b"fx-source")
-
-    fx_manifest = tmp_path / "fx/manifest.csv"
-    fx_manifest.write_text("header\n", encoding="utf-8")
-    return tmp_path
-
-
-def test_upload_sources_uploads_absent_objects_and_is_idempotent(tmp_path):
-    repo = make_repo(tmp_path)
-    storage = FakeStorage()
-
-    first = upload_sources(repo, "bucket", storage)
-    second = upload_sources(repo, "bucket", storage)
-
-    assert first.uploaded == 4
-    assert first.skipped == 0
-    assert second.uploaded == 0
-    assert second.skipped == 4
-    assert len(storage.upload_calls) == 4
-
-
-def test_upload_sources_stores_source_sha256_metadata(tmp_path):
-    repo = make_repo(tmp_path)
-    storage = FakeStorage()
-
-    upload_sources(repo, "bucket", storage)
-
-    for remote in storage.objects.values():
-        assert len(remote["metadata"][SOURCE_SHA256_METADATA_KEY]) == 64
-
-
-def test_upload_sources_rejects_conflicting_existing_object(tmp_path):
-    repo = make_repo(tmp_path)
-    storage = FakeStorage()
-    object_name = "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz"
-    storage.objects[object_name] = {
-        "bytes": b"different",
-        "metadata": {SOURCE_SHA256_METADATA_KEY: "0" * 64},
-    }
-
-    with pytest.raises(LandingConflictError):
-        upload_sources(repo, "bucket", storage)
-
-    assert object_name not in storage.upload_calls
+first = upload_sources(repo, "bucket", storage)
+second = upload_sources(repo, "bucket", storage)
+assert first == UploadSummary(uploaded=4, skipped=0)
+assert second == UploadSummary(uploaded=0, skipped=4)
 ```
 
-- [ ] **Step 2: Run workflow tests to prove RED**
+Assert every uploaded object has a 64-character `bahtflow-source-sha256` metadata value. Preload one transaction object with metadata `"0" * 64` and assert `LandingConflictError` is raised and that object is not uploaded again.
+
+Add a `smoke=True` test asserting exactly four selected objects: one transaction, one FX, and both manifests.
+
+- [ ] **Step 2: Run RED**
 
 ```powershell
 python -m pytest tests/pipeline/test_gcs_workflows.py -v
@@ -620,7 +507,7 @@ python -m pytest tests/pipeline/test_gcs_workflows.py -v
 
 Expected: FAIL because adapter/workflow modules do not exist.
 
-- [ ] **Step 3: Implement the adapter types and Google SDK wrapper**
+- [ ] **Step 3: Implement the thin Google SDK adapter**
 
 Create `pipeline/gcs_adapter.py`:
 
@@ -651,8 +538,7 @@ class GcsAdapter:
         except NotFound:
             if not create_if_missing:
                 raise RuntimeError(f"GCS bucket does not exist: {bucket_name}")
-            bucket = self._client.bucket(bucket_name)
-            bucket = self._client.create_bucket(bucket, location=location)
+            bucket = self._client.create_bucket(bucket_name, location=location)
 
         actual = (bucket.location or "").lower()
         expected = location.lower()
@@ -686,11 +572,14 @@ class GcsAdapter:
 
     def download_bytes(self, bucket_name: str, object_name: str) -> bytes:
         return self._client.bucket(bucket_name).blob(object_name).download_as_bytes()
+
+    def delete_object(self, bucket_name: str, object_name: str) -> None:
+        self._client.bucket(bucket_name).blob(object_name).delete()
 ```
 
-`if_generation_match=0` is deliberate defense in depth: even after the pre-check, GCS must refuse a race that creates the same object before upload.
+`if_generation_match=0` is mandatory race protection: GCS must reject an upload if the supposedly absent object appears after the pre-check.
 
-- [ ] **Step 4: Implement the workflow over the narrow adapter contract**
+- [ ] **Step 4: Implement the credential-free workflow**
 
 Create `pipeline/gcs_workflows.py`:
 
@@ -716,10 +605,10 @@ class UploadSummary:
 
 
 def _smoke_subset(sources):
-    one_txn = next(item for item in sources if item.object_name.startswith("transactions/"))
-    one_fx = next(item for item in sources if item.object_name.startswith("fx/"))
-    manifests = [item for item in sources if item.object_name.startswith("manifests/")]
-    return sorted([one_txn, one_fx, *manifests], key=lambda item: item.object_name)
+    one_txn = next(x for x in sources if x.object_name.startswith("transactions/"))
+    one_fx = next(x for x in sources if x.object_name.startswith("fx/"))
+    manifests = [x for x in sources if x.object_name.startswith("manifests/")]
+    return sorted([one_txn, one_fx, *manifests], key=lambda x: x.object_name)
 
 
 def upload_sources(repo_root: Path, bucket_name: str, adapter, *, smoke: bool = False) -> UploadSummary:
@@ -729,7 +618,6 @@ def upload_sources(repo_root: Path, bucket_name: str, adapter, *, smoke: bool = 
 
     uploaded = 0
     skipped = 0
-
     for source in sources:
         local_sha256 = sha256_file(source.local_path)
         remote = adapter.get_object_metadata(bucket_name, source.object_name)
@@ -738,11 +626,9 @@ def upload_sources(repo_root: Path, bucket_name: str, adapter, *, smoke: bool = 
             remote_exists=remote.exists,
             remote_metadata=remote.metadata,
         )
-
         if action is UploadAction.SKIP:
             skipped += 1
             continue
-
         adapter.upload_file(
             bucket_name,
             source.object_name,
@@ -754,89 +640,54 @@ def upload_sources(repo_root: Path, bucket_name: str, adapter, *, smoke: bool = 
     return UploadSummary(uploaded=uploaded, skipped=skipped)
 ```
 
-- [ ] **Step 5: Add and verify bounded smoke-subset behavior**
-
-Add a test asserting `upload_sources(..., smoke=True)` uploads exactly four objects: one transaction file, one FX file, and both manifests. This keeps live F02 verification bounded while the default remains the full corpus uploader.
-
-- [ ] **Step 6: Run Task 3 tests and compile**
-
-Host venv must have the GCP dependency available before importing `pipeline.gcs_adapter`:
+- [ ] **Step 5: Verify GREEN and commit**
 
 ```powershell
 python -m pip install -r requirements-gcp.txt
 python -m pytest tests/pipeline/test_gcs_workflows.py -v
 python -m py_compile pipeline/gcs_adapter.py pipeline/gcs_workflows.py
-```
-
-Expected: PASS.
-
-- [ ] **Step 7: Commit Task 3**
-
-```powershell
 git add pipeline/gcs_adapter.py pipeline/gcs_workflows.py tests/pipeline/test_gcs_workflows.py
 git commit -m "feat: add GCS landing adapter and workflow"
 ```
 
 ---
 
-### Task 4: CLI Entry Points and Read-Only ADC Docker Boundary
+### Task 4: CLI and Read-Only ADC Docker Boundary
 
 **Files:**
 - Create: `scripts/bootstrap_gcs.py`
 - Create: `scripts/upload_landing_sources.py`
+- Create: `scripts/verify_gcs_live.py`
 - Modify: `docker-compose.yml`
-- Modify: `.gitignore` only if verification identifies an uncovered credential pattern.
+- Modify: `.gitignore` only if a newly introduced credential filename pattern is not already ignored.
 
 **Interfaces:**
 - `python scripts/bootstrap_gcs.py --create-if-missing`
 - `python scripts/bootstrap_gcs.py --check-only`
 - `python scripts/upload_landing_sources.py --smoke`
-- `python scripts/upload_landing_sources.py` for full corpus when intentionally requested.
-- Compose service `gcp-toolbox` with profile `gcp`.
+- `python scripts/upload_landing_sources.py`
+- `python scripts/verify_gcs_live.py`
+- Compose profile/service: `--profile gcp`, `gcp-toolbox`.
 
-- [ ] **Step 1: Write CLI contract tests without invoking GCP**
-
-Extend `tests/pipeline/test_gcs_workflows.py` or create small source-level tests that assert:
-
-```text
-scripts/bootstrap_gcs.py
-  loads GcpSettings
-  instantiates GcsAdapter(settings.project_id)
-  passes create_if_missing from CLI flag
-
-scripts/upload_landing_sources.py
-  supports --smoke
-  calls upload_sources(repo_root, bucket_name, adapter, smoke=...)
-```
-
-Keep these tests source/argument-parser focused; do not mock Google internals.
-
-- [ ] **Step 2: Implement bootstrap CLI**
-
-Create `scripts/bootstrap_gcs.py`:
+- [ ] **Step 1: Implement bootstrap CLI**
 
 ```python
-from __future__ import annotations
-
+# scripts/bootstrap_gcs.py
 import argparse
 
 from pipeline.config import load_gcp_settings
 from pipeline.gcs_adapter import GcsAdapter
 
 
-def build_parser() -> argparse.ArgumentParser:
+def main() -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--create-if-missing", action="store_true")
     mode.add_argument("--check-only", action="store_true")
-    return parser
+    args = parser.parse_args()
 
-
-def main() -> int:
-    args = build_parser().parse_args()
     settings = load_gcp_settings()
-    adapter = GcsAdapter(settings.project_id)
-    location = adapter.ensure_bucket(
+    location = GcsAdapter(settings.project_id).ensure_bucket(
         settings.bucket_name,
         settings.location,
         create_if_missing=args.create_if_missing,
@@ -849,13 +700,10 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 3: Implement upload CLI**
-
-Create `scripts/upload_landing_sources.py`:
+- [ ] **Step 2: Implement upload CLI**
 
 ```python
-from __future__ import annotations
-
+# scripts/upload_landing_sources.py
 import argparse
 from pathlib import Path
 
@@ -864,26 +712,16 @@ from pipeline.gcs_adapter import GcsAdapter
 from pipeline.gcs_workflows import upload_sources
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="Upload one transaction, one FX file, and both manifests only.",
-    )
-    return parser
-
-
 def main() -> int:
-    args = build_parser().parse_args()
-    settings = load_gcp_settings()
-    adapter = GcsAdapter(settings.project_id)
-    repo_root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true")
+    args = parser.parse_args()
 
+    settings = load_gcp_settings()
     summary = upload_sources(
-        repo_root,
+        Path(__file__).resolve().parents[1],
         settings.bucket_name,
-        adapter,
+        GcsAdapter(settings.project_id),
         smoke=args.smoke,
     )
     print(f"landing upload complete: uploaded={summary.uploaded} skipped={summary.skipped}")
@@ -894,9 +732,88 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Add dedicated `gcp-toolbox` Compose service**
+- [ ] **Step 3: Implement exact live verification script**
 
-Add a service that reuses `docker/toolbox.Dockerfile` but receives GCP env and ADC only under profile `gcp`:
+Create `scripts/verify_gcs_live.py` so live proof is repeatable and does not rely on ad-hoc shell snippets:
+
+```python
+from __future__ import annotations
+
+import hashlib
+import tempfile
+from pathlib import Path
+
+from pipeline.config import load_gcp_settings
+from pipeline.gcs_adapter import GcsAdapter
+from pipeline.gcs_landing import (
+    SOURCE_SHA256_METADATA_KEY,
+    LandingConflictError,
+    decide_upload,
+    iter_landing_sources,
+    sha256_file,
+)
+
+
+def main() -> int:
+    settings = load_gcp_settings()
+    adapter = GcsAdapter(settings.project_id)
+    repo_root = Path(__file__).resolve().parents[1]
+
+    source = next(
+        item
+        for item in iter_landing_sources(repo_root)
+        if item.object_name.startswith("transactions/")
+    )
+    remote = adapter.get_object_metadata(settings.bucket_name, source.object_name)
+    if not remote.exists:
+        raise RuntimeError(f"Smoke object missing: {source.object_name}")
+
+    stored_sha = remote.metadata.get(SOURCE_SHA256_METADATA_KEY)
+    local_sha = sha256_file(source.local_path)
+    downloaded_sha = hashlib.sha256(
+        adapter.download_bytes(settings.bucket_name, source.object_name)
+    ).hexdigest()
+    if stored_sha != local_sha or downloaded_sha != local_sha:
+        raise RuntimeError("Live read/checksum verification failed")
+
+    disposable_name = "_smoke_conflict/disposable.txt"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        disposable = Path(tmp_dir) / "disposable.txt"
+        disposable.write_bytes(b"local-version")
+        adapter.upload_file(
+            settings.bucket_name,
+            disposable_name,
+            disposable,
+            {SOURCE_SHA256_METADATA_KEY: "0" * 64},
+        )
+        try:
+            conflict = adapter.get_object_metadata(settings.bucket_name, disposable_name)
+            try:
+                decide_upload(
+                    sha256_file(disposable),
+                    remote_exists=conflict.exists,
+                    remote_metadata=conflict.metadata,
+                )
+            except LandingConflictError:
+                pass
+            else:
+                raise RuntimeError("Expected checksum conflict was not raised")
+        finally:
+            adapter.delete_object(settings.bucket_name, disposable_name)
+
+    print("live GCS verification passed: read/checksum/conflict")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+The disposable path is outside canonical landing prefixes and is deleted in `finally`.
+
+- [ ] **Step 4: Add dedicated GCP Compose service**
+
+Add:
 
 ```yaml
   gcp-toolbox:
@@ -921,220 +838,162 @@ Add a service that reuses `docker/toolbox.Dockerfile` but receives GCP env and A
       - bahtflow
 ```
 
-Do not mount ADC into PostgreSQL. Do not add GCP credentials to the existing Airflow services in F02 because they still run only EmptyOperators.
+Do not mount ADC into PostgreSQL or existing Airflow services in F02.
 
-- [ ] **Step 5: Verify Compose config without starting GCP service**
-
-With `.env` containing a syntactically valid host path:
+- [ ] **Step 5: Verify container contract and full tests**
 
 ```powershell
 docker compose config --quiet
 docker compose --profile gcp config --services
-```
-
-Expected services include `gcp-toolbox`; existing Airflow/Postgres services remain unchanged.
-
-- [ ] **Step 6: Build the GCP toolbox image**
-
-```powershell
 docker compose --profile gcp build gcp-toolbox
 docker compose --profile gcp run --rm gcp-toolbox python -c "from google.cloud import storage; print(storage.__name__)"
-```
-
-Expected: import succeeds.
-
-- [ ] **Step 7: Run the full credential-free test suite**
-
-```powershell
 python -m pytest tests -v --basetemp .pytest_tmp
-docker compose config --quiet
 ```
 
-Expected: all tests PASS and Compose config exits 0.
+Expected: Compose config passes, `gcp-toolbox` is listed, Google Storage imports in container, pytest has zero failures.
 
-- [ ] **Step 8: Commit Task 4**
+- [ ] **Step 6: Commit**
 
 ```powershell
-git add scripts/bootstrap_gcs.py scripts/upload_landing_sources.py docker-compose.yml .gitignore
+git add scripts/bootstrap_gcs.py scripts/upload_landing_sources.py scripts/verify_gcs_live.py docker-compose.yml .gitignore
 git commit -m "feat: add local GCS CLI and ADC container boundary"
 ```
 
 ---
 
-### Task 5: Operator Documentation and Live GCP Verification
+### Task 5: README, Live GCP Gate, and Final Review
 
 **Files:**
 - Modify: `README.md`
-- Optionally modify the master roadmap/spec wording only to reflect the already-approved GCS-only F02 split; do not change architecture beyond the approved F02 spec.
 
 **Interfaces:**
-- Operator workflow from Windows PowerShell + Docker Desktop.
-- No secret/token values are printed or pasted into logs.
+- Windows PowerShell + Docker Desktop runbook.
+- No command prints credential/token file contents.
 
-- [ ] **Step 1: Document prerequisite IAM boundary**
+- [ ] **Step 1: Document IAM separation**
 
-Add a concise README section that states:
+README must state:
 
 ```text
 Developer/admin identity:
-- may create the bucket during bootstrap
-- must be allowed to impersonate the runtime service account
+- creates/verifies the bucket when needed
+- can impersonate the runtime service account
 
 Runtime service account:
-- normal landing access is bucket-scoped object access
+- gets bucket-scoped roles/storage.objectAdmin for F02 object create/get/list/delete
 - does not administer bucket IAM
 - does not create/delete the bucket
 ```
 
-Document that the runtime service account should receive bucket-scoped `roles/storage.objectAdmin` for F02 object create/get/list behavior, while bucket creation/location bootstrap is performed under the developer/admin identity. Do not grant project-wide Storage Admin to the runtime identity merely to make the smoke test easy.
+The developer identity needs `roles/iam.serviceAccountTokenCreator` on the runtime service account before impersonation.
 
-- [ ] **Step 2: Document developer ADC bootstrap phase**
-
-From the host, authenticate normal developer ADC when bucket creation is needed:
+- [ ] **Step 2: Bootstrap bucket under developer/admin ADC**
 
 ```powershell
 gcloud auth application-default login
-```
-
-Set real values in ignored `.env`, then verify/create with the admin-capable ADC:
-
-```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python scripts/bootstrap_gcs.py --create-if-missing
 ```
 
-If the bucket already exists, `--check-only` is sufficient.
+Expected: bucket is created in `BAHTFLOW_GCP_LOCATION` or existing matching bucket is verified. A location mismatch must fail.
 
-- [ ] **Step 3: Document impersonated runtime ADC phase**
+- [ ] **Step 3: Switch ADC to runtime service-account impersonation**
 
-After bootstrap/IAM is ready, replace local ADC with impersonated runtime ADC:
+Use the actual service-account email from `.env` in this command; do not print the ADC file:
 
 ```powershell
 gcloud auth application-default login `
-  --impersonate-service-account=$env:BAHTFLOW_RUNTIME_SERVICE_ACCOUNT
+  --impersonate-service-account=bahtflow-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com
 ```
 
-The developer identity must have `roles/iam.serviceAccountTokenCreator` on that service account. Do not ask the user to display or paste the ADC JSON.
-
-- [ ] **Step 4: Verify Docker resolves the impersonated ADC**
-
-Run only non-secret identity/client checks:
+- [ ] **Step 4: Verify Docker resolves ADC without revealing secrets**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -c "import google.auth; c,p=google.auth.default(); print('project=', p); print('credential_type=', type(c).__name__)"
 ```
 
-Expected: credential resolution succeeds. The command must not print token values.
+Expected: credential resolution succeeds; no token value is printed.
 
-- [ ] **Step 5: Run live bounded upload smoke test**
+- [ ] **Step 5: Run bounded landing smoke twice**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python scripts/upload_landing_sources.py --smoke
 ```
 
-Expected first run:
+Run the exact command again.
 
-```text
-landing upload complete: uploaded=4 skipped=0
-```
+Required evidence: the second run reports all four smoke selections skipped and uploads zero new objects. If the first run encounters already-existing identical smoke objects, its uploaded/skipped split may differ; that is acceptable.
 
-Run the exact command a second time.
-
-Expected second run:
-
-```text
-landing upload complete: uploaded=0 skipped=4
-```
-
-If the bucket already contains some identical smoke objects from an earlier run, the exact uploaded/skipped split may differ on the first invocation; the required evidence is that the subsequent invocation reports all selected smoke objects skipped and no duplicate/overwrite occurs.
-
-- [ ] **Step 6: Verify list/read/checksum live through the adapter**
-
-Use a short Python command or add a documented `python -c` check that:
-
-1. selects one uploaded smoke object;
-2. reads its metadata;
-3. confirms `bahtflow-source-sha256` is present and 64 hex characters;
-4. downloads the object bytes;
-5. compares SHA-256 of downloaded bytes with the stored metadata.
-
-Do not print credential contents.
-
-- [ ] **Step 7: Prove checksum conflict behavior using a disposable object**
-
-Do not alter a real landing object. Use a temporary local fixture and a disposable object such as:
-
-```text
-_smoke_conflict/disposable.txt
-```
-
-Create the remote disposable object with intentionally different `bahtflow-source-sha256` metadata, invoke the same pure `decide_upload`/workflow conflict path against it, and capture the hard-failure output. Remove the disposable object after the proof.
-
-If exercising this through the production uploader would require adding unsupported source-path behavior, use a small one-off verification command against `GcsAdapter.get_object_metadata()` plus `decide_upload()` rather than broadening the canonical landing contract.
-
-- [ ] **Step 8: Run final local regression suite**
+- [ ] **Step 6: Run exact live read/checksum/conflict proof**
 
 ```powershell
-python -m pytest tests -v --basetemp .pytest_tmp
-docker compose config --quiet
-git status
-git diff main...HEAD -- . ':!docs/superpowers/specs/2026-09-01-feat-02-setup-gcs-design.md' ':!docs/superpowers/plans/2026-09-01-feat-02-setup-gcs.md'
+docker compose --profile gcp run --rm gcp-toolbox `
+  python scripts/verify_gcs_live.py
 ```
 
 Expected:
 
-- pytest: zero failures;
-- Compose config: exit 0;
-- working tree clean after docs commit;
-- diff contains only F02 GCS/config/test/docs changes;
-- no BigQuery/dbt/Pandas/Airflow business implementation.
-
-- [ ] **Step 9: Perform repository secret hygiene check**
-
-At minimum inspect tracked filenames and diff:
-
-```powershell
-git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
-git diff main...HEAD --check
+```text
+live GCS verification passed: read/checksum/conflict
 ```
 
-Expected: no credential file is tracked and diff check returns no whitespace errors. Do not grep and print the contents of `.env` or ADC files.
+This proves one canonical object can be read back byte-for-byte, stored SHA-256 matches, a disposable mismatched object triggers the same hard-fail decision, and the disposable object is cleaned up.
 
-- [ ] **Step 10: Commit documentation**
+- [ ] **Step 7: Final credential-free regression and scope review**
+
+```powershell
+python -m pytest tests -v --basetemp .pytest_tmp
+docker compose config --quiet
+git diff main...HEAD --check
+git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
+git status
+git diff --stat main...HEAD
+```
+
+Expected:
+
+- pytest zero failures;
+- Compose config exit 0;
+- `git diff --check` clean;
+- no tracked credential/key file;
+- no BigQuery/dbt/Pandas/Airflow business implementation;
+- working tree clean after final docs commit.
+
+- [ ] **Step 8: Commit README**
 
 ```powershell
 git add README.md
-git commit -m "docs: add GCS bootstrap and smoke-test runbook"
+git commit -m "docs: add GCS bootstrap and verification runbook"
 ```
 
 ---
 
 ## Feature 02 Completion Gate
 
-Do not merge F02 until fresh evidence covers every item:
+Do not merge until fresh evidence covers every item:
 
 ```text
-[ ] google-cloud-storage dependency is reproducible in gcp-toolbox
-[ ] central GCP config validation tests pass
-[ ] canonical transaction/FX/manifest path tests pass
-[ ] byte-level SHA-256 tests pass
-[ ] absent -> upload behavior passes
-[ ] same checksum -> skip behavior passes
-[ ] different checksum -> hard fail behavior passes
-[ ] missing remote checksum -> hard fail behavior passes
-[ ] upload uses if_generation_match=0 race protection
+[ ] google-cloud-storage==3.13.1 is reproducible in gcp-toolbox
+[ ] central GCP config validation passes
+[ ] canonical transaction/FX/manifest mapping passes
+[ ] exact-byte SHA-256 tests pass
+[ ] absent -> upload passes
+[ ] same checksum -> skip passes
+[ ] different checksum -> hard fail passes
+[ ] missing remote checksum -> hard fail passes
+[ ] upload uses if_generation_match=0
 [ ] docker compose config succeeds
-[ ] ADC is read-only mounted only into gcp-toolbox in F02
+[ ] ADC bind mount is read-only and limited to gcp-toolbox in F02
 [ ] no credential file is tracked
 [ ] admin/bootstrap bucket create-or-check succeeds live
 [ ] impersonated runtime ADC resolves in Docker live
-[ ] live smoke upload/list/read/checksum succeeds
-[ ] rerun of smoke selection is idempotent
-[ ] disposable checksum mismatch fails without overwrite
+[ ] live smoke upload/read/checksum succeeds
+[ ] rerun smoke is idempotent
+[ ] disposable mismatch proof fails safely and cleans up
 [ ] full pytest suite has zero failures
-[ ] git diff contains no BigQuery/dbt/Pandas/Airflow business code
+[ ] final diff contains no BigQuery/dbt/Pandas/Airflow business code
 ```
 
-Only after all gates pass should the branch move to Review Diff -> final verification -> merge to `main`.
+Only after all gates pass: Review Diff -> final verification -> merge to `main`.
