@@ -23,7 +23,7 @@ The dedicated implementation plan may update roadmap wording so repository docum
 
 ## Authentication Decision
 
-Feature 02 uses:
+Normal BahtFlow runtime access uses:
 
 ```text
 Application Default Credentials
@@ -33,7 +33,7 @@ Service Account Impersonation
 
 The local developer authenticates with Google Cloud CLI and creates ADC capable of impersonating the configured BahtFlow runtime service account. Python code then uses the normal Google authentication chain; it does not read a committed service-account JSON key.
 
-Conceptually:
+Conceptually, normal runtime access is:
 
 ```text
 Dui / developer Google identity
@@ -50,10 +50,14 @@ Application Default Credentials
 Docker / Airflow / Python
             |
             v
-Google Cloud Storage
+Google Cloud Storage objects
 ```
 
 The exact local `gcloud` login command is operational documentation, not application logic. The application must rely on ADC rather than shelling out to `gcloud`.
+
+Bucket creation is a separate bootstrap concern. If the bucket does not exist, it is created using developer/admin ADC with the project-level permission needed to create a bucket. The runtime service account is not granted project-wide bucket-creation permission merely to satisfy bootstrap.
+
+The application does not switch identities internally. The operator chooses the appropriate ADC context before running a bootstrap or runtime verification command.
 
 ## Credential Boundary
 
@@ -61,13 +65,13 @@ Two roles are deliberately separated.
 
 ### Bootstrap identity
 
-The developer/admin identity may create or inspect the bucket and configure IAM during initial setup. This identity is not the identity expected for ordinary pipeline object access.
+The developer/admin identity may create or inspect the bucket and configure IAM during initial setup. This identity is used only for bootstrap operations that require project-level administrative permission.
 
 ### Runtime identity
 
-The configured runtime service account is the identity used by Python/Airflow through impersonated ADC for normal bucket/object operations.
+The configured runtime service account is the identity used by Python/Airflow through impersonated ADC for normal object operations after the bucket exists.
 
-The runtime identity should receive only the permissions required by Feature 02. It must not require bucket IAM administration or project-wide owner/editor permissions.
+The runtime identity should receive only the permissions required for the approved object-level workflow. It must not require bucket IAM administration, project-wide bucket creation, owner, or editor permissions.
 
 Feature 02 must not commit:
 
@@ -94,6 +98,8 @@ BAHTFLOW_RUNTIME_SERVICE_ACCOUNT
 `pipeline/config.py` owns parsing and validation of this configuration. Other modules consume a validated configuration object rather than repeatedly reading `os.environ` throughout the codebase.
 
 Validation failures must be explicit and early. Missing required values, blank values, or obviously invalid configuration must fail before a network operation is attempted.
+
+`BAHTFLOW_RUNTIME_SERVICE_ACCOUNT` documents and validates the identity expected for runtime impersonation. Python client construction still follows ADC; the application does not load a key for that account and does not perform a second in-process impersonation layer.
 
 ## GCS Landing Layout
 
@@ -192,11 +198,13 @@ The adapter should expose a narrow interface so tests can substitute a fake/stub
 Responsibilities:
 
 - load validated configuration;
-- authenticate through ADC;
+- authenticate through the currently selected ADC context;
 - check whether the configured bucket exists;
-- create the bucket only when absent and when the executing identity has bootstrap permission;
+- create the bucket only when absent and when the executing identity is the developer/admin bootstrap identity with the required permission;
 - verify that an existing bucket uses the configured location;
 - surface an explicit error when the existing bucket location does not match configuration.
+
+The script does not grant project-wide bucket-creation permission to the runtime service account. After one-time creation/IAM setup, normal verification and uploads use impersonated runtime ADC.
 
 Bootstrap does not change bucket IAM automatically unless the implementation plan identifies a minimal, testable reason to do so. IAM grant/setup steps may remain documented operator actions.
 
@@ -215,6 +223,8 @@ Responsibilities:
 It must not parse or clean transaction business values. Source content is copied byte-for-byte.
 
 ## Data Flow
+
+Landing upload:
 
 ```text
 committed source file
@@ -235,13 +245,10 @@ thin GCS adapter -> inspect target object
         +-- different/missing checksum -> hard fail
 ```
 
-For bootstrap:
+Bootstrap identity flow:
 
 ```text
-validated config
-      |
-      v
-ADC + impersonated runtime/bootstrap identity
+developer/admin ADC
       |
       v
 bucket lookup
@@ -253,6 +260,21 @@ bucket lookup
       +-- present + location differs -> fail
 ```
 
+Normal runtime identity flow after bootstrap:
+
+```text
+developer login
+      |
+      v
+ADC impersonating runtime service account
+      |
+      v
+Docker / Python Storage client
+      |
+      v
+list/read/upload approved landing objects
+```
+
 ## Error Handling
 
 Feature 02 favors explicit failure over silent repair.
@@ -261,7 +283,8 @@ Hard failures include:
 
 - missing/blank required configuration;
 - ADC unavailable;
-- service-account impersonation denied or invalid;
+- service-account impersonation denied or invalid for runtime verification;
+- bootstrap identity lacks bucket-creation permission when creation is required;
 - target bucket inaccessible;
 - existing bucket location differs from configured location;
 - expected local source file missing;
@@ -302,17 +325,24 @@ Tests use pure functions and a small fake/stub storage interface rather than dee
 
 Live verification is performed from Dui's environment because it owns the GCP project and credentials.
 
-Required evidence:
+Required evidence is split into bootstrap and runtime phases.
 
-1. ADC with service-account impersonation is configured successfully.
-2. The Docker/runtime environment can resolve ADC without copying a JSON key into the repository or image.
-3. The runtime/bootstrap command can authenticate to GCS.
-4. The configured bucket can be created or verified in the configured location.
-5. A sample source object can be uploaded to its canonical path.
-6. The object can be listed/read back.
-7. SHA-256 metadata can be read back and matches the local source file.
-8. Re-running the same upload skips the unchanged object.
-9. A deliberate checksum mismatch test fails without overwriting the remote object.
+Bootstrap phase, using developer/admin ADC when needed:
+
+1. The configured bucket can be created if absent, or verified if already present.
+2. The resulting bucket location matches `BAHTFLOW_GCP_LOCATION`.
+3. Required runtime IAM is configured without giving the runtime service account project-wide owner/editor or bucket-creation privileges.
+
+Runtime phase, using ADC that impersonates `BAHTFLOW_RUNTIME_SERVICE_ACCOUNT`:
+
+4. ADC with service-account impersonation is configured successfully.
+5. The Docker/runtime environment can resolve ADC without copying a JSON key into the repository or image.
+6. The Python Storage client authenticates to GCS as the runtime path.
+7. A sample source object can be uploaded to its canonical path.
+8. The object can be listed/read back.
+9. SHA-256 metadata can be read back and matches the local source file.
+10. Re-running the same upload skips the unchanged object.
+11. A deliberate checksum mismatch test fails without overwriting the remote object.
 
 The mismatch proof should use a disposable test object/path or controlled test fixture. It must not corrupt a real committed landing object merely to demonstrate failure behavior.
 
@@ -333,7 +363,8 @@ Only services that need GCP access should receive the credential mount/configura
 
 ## Security Principles
 
-- Prefer short-lived impersonated credentials to service-account JSON keys.
+- Prefer short-lived impersonated credentials to service-account JSON keys for runtime access.
+- Use developer/admin ADC only for one-time bootstrap operations that genuinely require project-level permission.
 - Keep runtime permissions least-privilege.
 - Keep bootstrap/admin permissions separate from normal pipeline runtime permissions.
 - Never commit ADC or service-account credentials.
@@ -377,12 +408,13 @@ Feature 02 is complete only when all of the following have fresh verification ev
 [ ] required GCP/GCS config is validated centrally
 [ ] transaction, FX, and manifest paths map to the approved GCS layout
 [ ] SHA-256 is stored and used as immutable source identity
+[ ] developer/admin bootstrap can create or verify the configured bucket without expanding runtime privileges
+[ ] ADC + service-account impersonation works for runtime access in Dui's local environment
+[ ] required Docker/Python runtime can authenticate to GCS without a JSON key in repo/image
+[ ] configured bucket exists in the configured location
 [ ] absent source object uploads successfully
 [ ] unchanged existing object is skipped on rerun
 [ ] conflicting or checksum-ambiguous existing object hard-fails without overwrite
-[ ] ADC + service-account impersonation works in Dui's local environment
-[ ] required Docker/Python runtime can authenticate to GCS without a JSON key in repo/image
-[ ] configured bucket exists in the configured location
 [ ] live upload/list/read/checksum smoke test succeeds
 ```
 
