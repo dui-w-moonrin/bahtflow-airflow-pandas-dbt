@@ -56,7 +56,7 @@ Feature 00 provides the shared PostgreSQL and toolbox foundation.
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up -d --build
+docker compose up -d --build postgres toolbox
 docker compose ps
 docker compose exec postgres pg_isready -U bahtflow -d bahtflow
 docker compose exec toolbox python --version
@@ -69,7 +69,7 @@ docker compose down
 
 Feature 01 runs Apache Airflow `3.3.1` with LocalExecutor, the existing PostgreSQL metadata backend, a separate DAG processor, and the API server on `http://localhost:8080`.
 
-The SimpleAuthManager all-admin setting and example API/JWT secrets are intentionally local-development settings. Do not reuse them for a shared or production deployment.
+The SimpleAuthManager all-admin setting and example API/JWT/Fernet secrets are intentionally local-development settings. Do not reuse them for a shared or production deployment.
 
 Initialize the metadata schema:
 
