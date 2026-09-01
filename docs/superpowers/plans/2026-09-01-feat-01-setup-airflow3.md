@@ -18,6 +18,7 @@
 - Use `http://airflow-api-server:8080/execution/` as the internal Execution API URL.
 - Use `Asia/Bangkok` as Airflow default timezone and DAG timezone.
 - Use SimpleAuthManager all-admin mode only for this local development feature.
+- Share API secret, API-auth JWT secret, and Fernet key consistently across Airflow components through local `.env` values.
 - Set `catchup=False`; historical runs are explicit backfills.
 - Do not add GCS, BigQuery, Pandas, dbt, transaction ingestion, FX ingestion, or data-quality implementation.
 
@@ -34,11 +35,11 @@
 - Produces task IDs `start`, `discover_tx_files`, `validate_tx_files`, `load_tx_raw`, `discover_fx`, `validate_fx`, `load_fx_raw`, `dbt_transform`, `dbt_test`, `reconcile`, `finish`.
 - Produces daily schedule, `catchup=False`, `Asia/Bangkok` start date, and only `EmptyOperator` tasks.
 
-- [ ] **Step 1: Write the failing DAG tests** that import `airflow/dags/bahtflow_daily.py`, assert the exact task-id set, daily schedule/catchup contract, and direct downstream dependency map.
-- [ ] **Step 2: Run `python -m pytest tests/airflow/test_bahtflow_daily_dag.py -v --basetemp .pytest_tmp` in an Airflow-enabled environment and verify RED** because the DAG file does not exist yet.
-- [ ] **Step 3: Implement the minimal DAG** using `airflow.sdk.DAG`, `airflow.providers.standard.operators.empty.EmptyOperator`, and `pendulum.datetime(2025, 7, 22, tz="Asia/Bangkok")`.
-- [ ] **Step 4: Re-run the focused test and verify GREEN.**
-- [ ] **Step 5: Commit** with message `Add Airflow DAG skeleton contract`.
+- [x] **Step 1: Write failing source-contract tests** that assert the DAG file, stable Airflow 3 imports, exact task-id set, daily schedule/catchup/timezone contract, and direct dependency expressions.
+- [x] **Step 2: Verify RED.** The isolated test fixture failed 4 tests because `airflow/dags/bahtflow_daily.py` did not exist.
+- [x] **Step 3: Implement the minimal DAG** using `airflow.sdk.DAG`, `airflow.providers.standard.operators.empty.EmptyOperator`, and `pendulum.datetime(2025, 7, 22, tz="Asia/Bangkok")`.
+- [x] **Step 4: Verify GREEN.** Focused source-contract suite passed `4 passed`.
+- [x] **Step 5: Commit** the DAG and tests on `feat/01-setup-airflow3`.
 
 ### Task 2: Add Airflow 3 Compose services
 
@@ -53,13 +54,13 @@
 - All Airflow services mount `./airflow/dags:/opt/airflow/dags` and `./airflow/logs:/opt/airflow/logs`.
 - API server publishes `${AIRFLOW_API_PORT}:8080`.
 
-- [ ] **Step 1: Extend `.env.example`** with `AIRFLOW_API_PORT=8080`, `AIRFLOW_UID=50000`, and a non-secret development-only Fernet key placeholder only if required by runtime validation; do not commit a generated private credential.
-- [ ] **Step 2: Extend `.gitignore`** with `airflow/logs/*` and `!airflow/logs/.gitkeep`.
-- [ ] **Step 3: Add a shared Compose Airflow environment** containing LocalExecutor, PostgreSQL SQLAlchemy connection, `LOAD_EXAMPLES=False`, SimpleAuth all-admin mode, internal Execution API URL, API base URL, and Bangkok timezone.
-- [ ] **Step 4: Add `airflow-init` with `airflow db migrate` and `restart: "no"`; make long-running Airflow services depend on successful init and healthy PostgreSQL.**
-- [ ] **Step 5: Add API server health check against `/api/v2/monitor/health`; add scheduler and DAG processor commands.**
-- [ ] **Step 6: Run `docker compose config --quiet` and verify exit code 0.**
-- [ ] **Step 7: Commit** with message `Add Airflow 3 Docker services`.
+- [x] **Step 1: Extend `.env.example`** with Airflow image, UID, API port, development-only API/JWT secrets, and one valid shared development Fernet key.
+- [x] **Step 2: Extend `.gitignore`** with `airflow/logs/*`, `!airflow/logs/.gitkeep`, and the repository-local pytest temp directory.
+- [x] **Step 3: Add a shared Compose Airflow environment** containing LocalExecutor, PostgreSQL SQLAlchemy connection, `LOAD_EXAMPLES=False`, SimpleAuth all-admin mode, internal Execution API URL, API base URL, Bangkok timezone, API/JWT secrets, and Fernet key.
+- [x] **Step 4: Add `airflow-init`** with `airflow db migrate` and `restart: "no"`; long-running Airflow services depend on successful init and healthy PostgreSQL.
+- [x] **Step 5: Add API server health check** against `/api/v2/monitor/health`; add scheduler and DAG processor commands.
+- [ ] **Step 6: Run `docker compose config --quiet` on the target Docker host and verify exit code 0.** Pending user-host runtime verification because this execution environment has no Docker daemon/CLI.
+- [x] **Step 7: Commit** Compose/environment changes on the feature branch.
 
 ### Task 3: Prove runtime and bounded backfill
 
@@ -72,10 +73,10 @@
 - [ ] **Step 1: Run `docker compose up airflow-init` and verify migration exits 0.**
 - [ ] **Step 2: Run `docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor` and verify all long-running Airflow services remain up.**
 - [ ] **Step 3: Run `docker compose exec airflow-scheduler airflow version` and verify `3.3.1`.**
-- [ ] **Step 4: Run `docker compose exec airflow-scheduler airflow dags list` and verify `bahtflow_daily` is present with no import errors.**
-- [ ] **Step 5: Trigger one logical-date run using Airflow CLI/API and verify all EmptyOperator tasks finish successfully.**
-- [ ] **Step 6: Run `airflow backfill create --dag-id bahtflow_daily --from-date 2025-07-22 --to-date 2025-07-24` and verify exactly the intended three partition dates succeed.**
-- [ ] **Step 7: Verify the API health endpoint reports healthy metadata database, scheduler, and DAG processor.**
+- [ ] **Step 4: Run `docker compose exec airflow-scheduler airflow dags list` and `airflow dags list-import-errors`; verify `bahtflow_daily` is present with no import errors.**
+- [ ] **Step 5: Run `airflow dags test bahtflow_daily 2025-07-25 --use-executor` and verify the EmptyOperator graph succeeds.**
+- [ ] **Step 6: Run `airflow backfill create --dag-id bahtflow_daily --from-date 2025-07-22 --to-date 2025-07-24 --max-active-runs 2` and verify the intended three partition dates succeed.**
+- [ ] **Step 7: Verify `/api/v2/monitor/health` reports healthy metadata database, scheduler, and DAG processor state.**
 
 ### Task 4: Document the developer workflow
 
@@ -85,11 +86,11 @@
 **Interfaces:**
 - Documents fresh-clone startup, Airflow UI URL, service checks, one-day execution, three-day backfill, and shutdown commands.
 
-- [ ] **Step 1: Add an Airflow 3 section** after the Feature 00 Docker section with exact PowerShell commands for `.env`, init, startup, health, DAG listing, bounded backfill, and shutdown.
-- [ ] **Step 2: State explicitly that SimpleAuth all-admin mode is development-only and that F01 has no GCP/Pandas/dbt behavior.**
-- [ ] **Step 3: Re-run the credential-free Python tests and `docker compose config --quiet`.**
-- [ ] **Step 4: Review `git diff` for scope creep and secrets.**
-- [ ] **Step 5: Commit** with message `Document Airflow 3 local workflow`.
+- [x] **Step 1: Add an Airflow 3 section** with exact PowerShell commands for init, startup, health, DAG listing, single-date execution, bounded backfill, and shutdown.
+- [x] **Step 2: State explicitly** that SimpleAuth all-admin mode and example secrets are development-only and F01 has no GCP/Pandas/dbt behavior.
+- [ ] **Step 3: Re-run the full credential-free Python tests and `docker compose config --quiet` on the target checkout.** Focused DAG source tests are already green; full checkout/Docker verification is pending.
+- [x] **Step 4: Review the branch diff** against `main`; changes are limited to Airflow setup, tests, docs, and local configuration.
+- [x] **Step 5: Commit** README changes on the feature branch.
 
 ## Final Verification
 
@@ -101,8 +102,24 @@ docker compose up airflow-init
 docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
 docker compose ps
 docker compose exec airflow-scheduler airflow version
+docker compose exec airflow-scheduler airflow config get-value core executor
 docker compose exec airflow-scheduler airflow dags list
+docker compose exec airflow-scheduler airflow dags list-import-errors
 python -m pytest tests -v --basetemp .pytest_tmp
 ```
 
-Then create and inspect the bounded three-day backfill for `2025-07-22` through `2025-07-24`. Do not merge until runtime evidence confirms the API server, scheduler, DAG processor, DAG import, and backfill behavior.
+Then run:
+
+```powershell
+docker compose exec airflow-scheduler `
+  airflow dags test bahtflow_daily 2025-07-25 --use-executor
+
+docker compose exec airflow-scheduler `
+  airflow backfill create `
+    --dag-id bahtflow_daily `
+    --from-date 2025-07-22 `
+    --to-date 2025-07-24 `
+    --max-active-runs 2
+```
+
+Do not merge until runtime evidence confirms the API server, scheduler, DAG processor, DAG import, LocalExecutor execution, and three-date backfill behavior.
