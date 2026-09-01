@@ -12,7 +12,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_API_PORT:-8080}
     AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
-    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
