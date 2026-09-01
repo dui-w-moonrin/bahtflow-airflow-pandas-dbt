@@ -290,4 +290,3 @@ git ls-remote --heads origin main
 ```
 
 Expected: remote `main` resolves to the merged commit and the feature branch is deleted locally.
-
