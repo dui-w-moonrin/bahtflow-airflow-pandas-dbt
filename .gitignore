@@ -6,4 +6,7 @@
 service-account*.json
 __pycache__/
 .pytest_cache/
+.pytest_tmp/
 .venv/
+airflow/logs/*
+!airflow/logs/.gitkeep
