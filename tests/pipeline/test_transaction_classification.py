@@ -2,8 +2,12 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pandas as pd
+import pytest
 
-from pipeline.transaction_classification import validate_and_canonicalize_transactions
+from pipeline.transaction_classification import (
+    TransactionClassificationError,
+    validate_and_canonicalize_transactions,
+)
 
 
 def raw_row(**overrides):
@@ -36,3 +40,116 @@ def test_base_validation_canonicalizes_valid_values():
     assert row["_amount_numeric"] == Decimal("100.50")
     assert row["_currency_canonical"] == "USD"
     assert row["_base_reason_codes"] == []
+
+
+def test_zero_amount_is_valid_and_negative_amount_is_flagged():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(source_row_id="zero", amount="0"),
+                raw_row(source_row_id="negative", amount="-0.01"),
+            ]
+        ),
+        date(2025, 7, 22),
+    ).set_index("source_row_id")
+
+    assert result.loc["zero", "_base_reason_codes"] == []
+    assert result.loc["negative", "_base_reason_codes"] == ["NEGATIVE_AMOUNT"]
+
+
+def test_invalid_amount_covers_blank_text_non_finite_scale_and_width():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(source_row_id="blank", amount=" "),
+                raw_row(source_row_id="text", amount="N/A"),
+                raw_row(source_row_id="inf", amount="Infinity"),
+                raw_row(source_row_id="scale", amount="0.1234567891"),
+                raw_row(
+                    source_row_id="width",
+                    amount="100000000000000000000000000000",
+                ),
+            ]
+        ),
+        date(2025, 7, 22),
+    )
+
+    assert result["_base_reason_codes"].tolist() == [
+        ["INVALID_AMOUNT"],
+        ["INVALID_AMOUNT"],
+        ["INVALID_AMOUNT"],
+        ["INVALID_AMOUNT"],
+        ["INVALID_AMOUNT"],
+    ]
+
+
+def test_datetime_rules_distinguish_parse_failure_from_batch_mismatch():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(source_row_id="bad-date", dtts="not-a-date"),
+                raw_row(
+                    source_row_id="wrong-day",
+                    dtts="2025-07-23 00:00:00",
+                ),
+            ]
+        ),
+        date(2025, 7, 22),
+    )
+
+    assert result["_base_reason_codes"].tolist() == [
+        ["INVALID_DTTS"],
+        ["DTTS_BATCH_DATE_MISMATCH"],
+    ]
+
+
+def test_currency_and_region_rules_canonicalize_or_reject_explicitly():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(source_row_id="eur", currency=" eur ", region="north"),
+                raw_row(source_row_id="gbp", currency="GBP", region="north"),
+                raw_row(
+                    source_row_id="bad-region",
+                    currency="THB",
+                    region="unknown",
+                ),
+            ]
+        ),
+        date(2025, 7, 22),
+    ).set_index("source_row_id")
+
+    assert result.loc["eur", "_currency_canonical"] == "EUR"
+    assert result.loc["eur", "_base_reason_codes"] == []
+    assert result.loc["gbp", "_base_reason_codes"] == ["INVALID_CURRENCY"]
+    assert result.loc["bad-region", "_base_reason_codes"] == ["INVALID_REGION"]
+
+
+def test_multiple_base_failures_keep_fixed_reason_order():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(
+                    txn=" ",
+                    amount="N/A",
+                    currency=" gbp ",
+                    region="unknown",
+                )
+            ]
+        ),
+        date(2025, 7, 22),
+    )
+
+    assert result.iloc[0]["_base_reason_codes"] == [
+        "MISSING_TXN",
+        "INVALID_AMOUNT",
+        "INVALID_CURRENCY",
+        "INVALID_REGION",
+    ]
+
+
+def test_missing_required_raw_column_fails_explicitly():
+    frame = pd.DataFrame([raw_row()]).drop(columns=["source_row_id"])
+
+    with pytest.raises(TransactionClassificationError, match="source_row_id"):
+        validate_and_canonicalize_transactions(frame, date(2025, 7, 22))
