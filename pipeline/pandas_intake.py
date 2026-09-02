@@ -78,3 +78,63 @@ def make_source_row_id(
 ) -> str:
     identity = f"{source_file}|{source_checksum}|{source_row_number}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _utc_text(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise PandasIntakeError("ingested_at must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _read_source_csv(
+    source_bytes: bytes,
+    *,
+    expected_columns: tuple[str, ...],
+    compression: str | None,
+    label: str,
+) -> pd.DataFrame:
+    frame = pd.read_csv(
+        io.BytesIO(source_bytes),
+        compression=compression,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+    )
+    actual_columns = tuple(frame.columns)
+    if actual_columns != expected_columns:
+        raise PandasIntakeError(
+            f"{label} header mismatch: "
+            f"expected={expected_columns} actual={actual_columns}"
+        )
+    return frame
+
+
+def prepare_transaction_frame(
+    *,
+    source_bytes: bytes,
+    source_file: str,
+    source_checksum: str,
+    region: str,
+    batch_date: date,
+    ingested_at: datetime,
+) -> pd.DataFrame:
+    verify_source_checksum(source_bytes, source_checksum)
+    frame = _read_source_csv(
+        source_bytes,
+        expected_columns=TRANSACTION_SOURCE_COLUMNS,
+        compression="gzip",
+        label="Transaction",
+    )
+    frame["region"] = region
+    frame["source_file"] = source_file
+    frame["source_checksum"] = source_checksum
+    frame["source_row_number"] = range(1, len(frame) + 1)
+    frame["source_row_id"] = [
+        make_source_row_id(source_file, source_checksum, row_number)
+        for row_number in frame["source_row_number"]
+    ]
+    frame["batch_date"] = batch_date.isoformat()
+    frame["ingested_at"] = _utc_text(ingested_at)
+    return frame
