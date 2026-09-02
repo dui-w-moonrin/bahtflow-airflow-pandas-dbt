@@ -24,6 +24,10 @@ from pipeline.transaction_classification import (
 )
 
 
+class ClassificationLoadError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ClassificationLoadSummary:
     batch_date: str
@@ -121,6 +125,12 @@ def classify_and_load_batch(
     reconciled = (
         len(raw_frame) == accepted_partition_rows + quarantine_partition_rows
     )
+    if not reconciled:
+        raise ClassificationLoadError(
+            "Persisted classification reconciliation failed: "
+            f"raw={len(raw_frame)} accepted={accepted_partition_rows} "
+            f"quarantine={quarantine_partition_rows}"
+        )
 
     return ClassificationLoadSummary(
         batch_date=batch_date.isoformat(),
@@ -131,5 +141,5 @@ def classify_and_load_batch(
         quarantine_inserted_rows=quarantine_inserted,
         accepted_partition_rows=accepted_partition_rows,
         quarantine_partition_rows=quarantine_partition_rows,
-        reconciled=reconciled,
+        reconciled=True,
     )
