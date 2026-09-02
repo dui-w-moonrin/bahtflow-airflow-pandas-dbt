@@ -37,6 +37,24 @@ class RawLoadSummary:
     fx_partition_rows: int
 
 
+@dataclass(frozen=True)
+class TransactionRawLoadSummary:
+    batch_date: str
+    tx_files: int
+    tx_source_rows: int
+    tx_inserted_rows: int
+    tx_partition_rows: int
+
+
+@dataclass(frozen=True)
+class FxRawLoadSummary:
+    batch_date: str
+    fx_status: str
+    fx_source_rows: int
+    fx_inserted_rows: int
+    fx_partition_rows: int
+
+
 def _required_checksum(metadata) -> str:
     checksum = metadata.metadata.get(SOURCE_SHA256_METADATA_KEY)
     if not checksum:
@@ -90,16 +108,15 @@ def _load_fx_frame(*, batch_date, bucket_name, gcs_adapter, ingested_at):
     )
 
 
-def load_raw_batch(
+def load_transaction_raw_batch(
     *,
     batch_date: date,
     bucket_name: str,
     gcs_adapter,
     bigquery_adapter,
     ingested_at: datetime | None = None,
-) -> RawLoadSummary:
+) -> TransactionRawLoadSummary:
     invocation_time = ingested_at or datetime.now(timezone.utc)
-
     tx_frame = _load_tx_frame(
         batch_date=batch_date,
         bucket_name=bucket_name,
@@ -125,7 +142,24 @@ def load_raw_batch(
         TRANSACTIONS_PARTITION_FIELD,
         batch_date,
     )
+    return TransactionRawLoadSummary(
+        batch_date=batch_date.isoformat(),
+        tx_files=len(EXPECTED_REGIONS),
+        tx_source_rows=len(tx_frame),
+        tx_inserted_rows=tx_inserted,
+        tx_partition_rows=tx_partition_rows,
+    )
 
+
+def load_fx_raw_batch(
+    *,
+    batch_date: date,
+    bucket_name: str,
+    gcs_adapter,
+    bigquery_adapter,
+    ingested_at: datetime | None = None,
+) -> FxRawLoadSummary:
+    invocation_time = ingested_at or datetime.now(timezone.utc)
     fx_status, fx_frame = _load_fx_frame(
         batch_date=batch_date,
         bucket_name=bucket_name,
@@ -154,15 +188,46 @@ def load_raw_batch(
         FX_RATES_PARTITION_FIELD,
         batch_date,
     )
-
-    return RawLoadSummary(
+    return FxRawLoadSummary(
         batch_date=batch_date.isoformat(),
-        tx_files=5,
-        tx_source_rows=len(tx_frame),
-        tx_inserted_rows=tx_inserted,
-        tx_partition_rows=tx_partition_rows,
         fx_status=fx_status,
         fx_source_rows=len(fx_frame),
         fx_inserted_rows=fx_inserted,
         fx_partition_rows=fx_partition_rows,
+    )
+
+
+def load_raw_batch(
+    *,
+    batch_date: date,
+    bucket_name: str,
+    gcs_adapter,
+    bigquery_adapter,
+    ingested_at: datetime | None = None,
+) -> RawLoadSummary:
+    invocation_time = ingested_at or datetime.now(timezone.utc)
+    tx = load_transaction_raw_batch(
+        batch_date=batch_date,
+        bucket_name=bucket_name,
+        gcs_adapter=gcs_adapter,
+        bigquery_adapter=bigquery_adapter,
+        ingested_at=invocation_time,
+    )
+    fx = load_fx_raw_batch(
+        batch_date=batch_date,
+        bucket_name=bucket_name,
+        gcs_adapter=gcs_adapter,
+        bigquery_adapter=bigquery_adapter,
+        ingested_at=invocation_time,
+    )
+    return RawLoadSummary(
+        batch_date=batch_date.isoformat(),
+        tx_files=tx.tx_files,
+        tx_source_rows=tx.tx_source_rows,
+        tx_inserted_rows=tx.tx_inserted_rows,
+        tx_partition_rows=tx.tx_partition_rows,
+        fx_status=fx.fx_status,
+        fx_source_rows=fx.fx_source_rows,
+        fx_inserted_rows=fx.fx_inserted_rows,
+        fx_partition_rows=fx.fx_partition_rows,
     )
