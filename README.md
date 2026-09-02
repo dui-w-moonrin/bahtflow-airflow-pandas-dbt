@@ -6,7 +6,7 @@ BahtFlow is a production-minded batch ELT portfolio project for practising the d
 
 The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A` so later stages can classify and quarantine them instead of silently discarding evidence.
 
-Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently. Feature 04 adds one-date Pandas intake and idempotent raw loading from GCS into those BigQuery raw tables.
+Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently. Feature 04 adds one-date Pandas intake and idempotent raw loading from GCS into those BigQuery raw tables. Feature 05 adds Pandas data-quality classification into typed accepted rows and auditable raw quarantine rows with deterministic batch-local duplicate handling and idempotent BigQuery persistence.
 
 Read the [data contract](data/README.md) for the source layout and validation manifest. The current v1 roadmap is in [the Pandas v1 design](docs/superpowers/specs/2026-09-02-pandas-v1-roadmap-design.md).
 
@@ -238,6 +238,49 @@ Idempotency uses deterministic `source_row_id = SHA256(source_file | source_chec
 
 Feature 04 intentionally does not classify business-quality failures, split accepted/quarantine records, resolve effective FX, or perform currency conversion. Those transformations belong to later v1 features.
 
+## Feature 05: Pandas data-quality classification
+
+Feature 05 reads exactly one `bahtflow_raw.transactions` partition and classifies every raw source row with Pandas into one of two BigQuery outputs:
+
+```text
+bahtflow_analytics.transactions_accepted   typed + canonical
+bahtflow_ops.transactions_quarantine       raw evidence + ordered reason_codes
+```
+
+Bootstrap or verify the two output tables:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.bootstrap_classification
+```
+
+Classify one batch:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.classify_transactions --batch-date 2025-07-22
+```
+
+Accepted rows use canonical `txn`, typed BigQuery `DATETIME`, BigQuery `NUMERIC` backed by Python `Decimal`, canonical `THB`/`USD`/`EUR`, and validated region values. Quarantine rows preserve the original raw business fields and source lineage and add deterministic ordered `reason_codes`; no partially canonicalized business values overwrite the raw evidence.
+
+Base-invalid rows are quarantined before duplicate comparison. Duplicate handling is batch-local in v1: canonical `txn` is the duplicate key, exact canonical payload replays keep the lowest `(source_file, source_row_number)` and quarantine later copies as `DUPLICATE_REPLAY`, while conflicting canonical payloads quarantine every base-valid occurrence as `DUPLICATE_CONFLICT`.
+
+Persistence is append-only and idempotent by target partition plus `source_row_id`. An unchanged rerun inserts zero accepted rows and zero quarantine rows while persisted partition counts stay unchanged. If accepted rows were written but the quarantine write failed, a retry skips already-persisted accepted IDs and appends only the missing quarantine rows.
+
+For the live acceptance batch `2025-07-22`, the observed source partition contained `8,978` raw rows. The classification run measured `8,803` accepted rows and `175` quarantine rows, satisfying `8,978 = 8,803 + 175`; the immediate unchanged rerun inserted `0` accepted and `0` quarantine rows. The observed quarantine reason distribution was:
+
+```text
+DUPLICATE_CONFLICT  52
+DUPLICATE_REPLAY    29
+INVALID_AMOUNT      51
+INVALID_CURRENCY    21
+NEGATIVE_AMOUNT     22
+```
+
+Live duplicate evidence for that batch showed one `DUPLICATE_REPLAY` transaction with exactly one accepted winner and one `DUPLICATE_CONFLICT` transaction with zero accepted occurrences.
+
+Feature 05 intentionally stops before effective-FX resolution and currency conversion (Feature 06) and before production Airflow wiring/backfill (Feature 07).
+
 ## Development checks
 
 ```powershell
@@ -248,9 +291,13 @@ python -m py_compile `
   pipeline/bigquery_adapter.py `
   pipeline/pandas_intake.py `
   pipeline/raw_load.py `
+  pipeline/transaction_classification.py `
+  pipeline/classification_load.py `
   scripts/bootstrap_bigquery.py `
   scripts/verify_bigquery_live.py `
-  scripts/load_raw_batch.py
+  scripts/load_raw_batch.py `
+  scripts/bootstrap_classification.py `
+  scripts/classify_transactions.py
 
 docker compose config --quiet
 git diff --check
