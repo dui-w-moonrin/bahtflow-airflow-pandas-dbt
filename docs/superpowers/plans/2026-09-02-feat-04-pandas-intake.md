@@ -4,7 +4,7 @@
 
 **Goal:** Load one logical-date transaction batch and optional same-day FX from immutable GCS into existing BigQuery raw tables through Pandas, while preserving source strings and making an unchanged rerun insert zero additional rows.
 
-**Architecture:** Reuse the existing F02 `GcsAdapter` to list/download objects and read checksum metadata, then use focused Pandas functions to validate headers, preserve raw strings, add deterministic source metadata, and anti-filter already-loaded `source_row_id` values. Extend the existing F03 `BigQueryAdapter` only with partition-scoped ID lookup, append-only JSON load jobs, and partition row counts. Keep the CLI thin and put orchestration in a small `pipeline/raw_load.py` module so live behavior is credential-free testable.
+**Architecture:** Reuse the F02 `GcsAdapter` for listing/downloading objects and checksum metadata. Put transport validation, raw-string preservation, deterministic source metadata, and anti-filtering in focused Pandas functions. Extend the F03 `BigQueryAdapter` only with partition-scoped source-ID lookup, append-only load jobs, and partition row counts. Put orchestration in `pipeline/raw_load.py`; keep `scripts/load_raw_batch.py` as a thin CLI.
 
 **Tech Stack:** Python 3.12, pandas 2.3.3, `google-cloud-storage==3.13.1`, `google-cloud-bigquery==3.44.0`, BigQuery, GCS, pytest, Docker Compose.
 
@@ -12,22 +12,22 @@
 
 ## Global Constraints
 
-- Thin mode: F04 has one primary outcome only — one logical-date Pandas intake reaches BigQuery raw idempotently.
+- F04 has one outcome only: one logical-date Pandas intake reaches BigQuery raw idempotently.
 - Transaction intake requires exactly five canonical region objects: `bkk`, `central`, `north`, `northeast`, `south`.
 - Same-day FX is optional. Missing FX returns `NO_NEW_RATE` and does not fail the transaction batch.
-- Read transaction source columns as strings with Pandas default NA interpretation disabled; literal values such as `N/A` and blanks remain source evidence.
-- Do not parse or normalize transaction `txn`, `dtts`, `amount`, or `currency` in F04.
+- Pandas reads source fields as strings with default NA interpretation disabled; literal `N/A`, blanks, malformed timestamps, malformed amounts, and lowercase currency remain source evidence.
+- Do not parse/normalize `txn`, `dtts`, `amount`, or `currency` in F04.
 - Do not deduplicate by transaction ID or business payload in F04.
-- Verify every downloaded object against GCS custom metadata key `bahtflow-source-sha256` before Pandas processing.
+- Verify every downloaded object against GCS metadata key `bahtflow-source-sha256` before Pandas processing.
 - `source_row_number` is 1-based and excludes the CSV header.
-- `source_row_id = SHA256(source_file | source_checksum | source_row_number)` for both transaction and FX rows.
+- `source_row_id = SHA256(source_file | source_checksum | source_row_number)` for transaction and FX rows.
 - `ingested_at` is one UTC timestamp per load invocation and is excluded from idempotency identity.
-- Query existing `source_row_id` values only for the relevant BigQuery partition, anti-filter in Pandas, then append only unseen rows.
-- The thin-v1 idempotency design assumes one writer for one logical batch. Do not add staging tables, BigQuery `MERGE`, locks, or concurrent-writer guarantees.
-- Reuse `bahtflow_raw.transactions` and `bahtflow_raw.fx_rates`; do not create new warehouse tables.
-- No business-quality classification, accepted/quarantine outputs, effective FX carry-forward, currency conversion, fact/mart tables, Airflow task wiring, backfill, dbt, Spark, streaming, or full 360-day execution in F04.
-- Reuse `BAHTFLOW_GCP_PROJECT`, `BAHTFLOW_GCS_BUCKET`, `BAHTFLOW_GCP_LOCATION`, and the existing ADC/service-account impersonation boundary. Add no new credential/configuration mechanism.
-- Live acceptance date is `2025-07-22`. The committed manifest proves five transaction files totaling 8,978 rows and same-day FX with exactly 2 rows.
+- Query existing `source_row_id` values only for the relevant BigQuery partition, anti-filter in Pandas, then append unseen rows.
+- Thin-v1 assumes one writer per logical batch. Do not add staging tables, `MERGE`, locks, or concurrent-writer guarantees.
+- Reuse only `bahtflow_raw.transactions` and `bahtflow_raw.fx_rates`.
+- No F05 business DQ, F06 effective FX/conversion, F07 Airflow wiring/backfill, dbt, Spark, streaming, or full 360-day execution.
+- Reuse existing GCP env vars and ADC/service-account impersonation. Add no credential mechanism.
+- Live acceptance date is `2025-07-22`: committed manifests prove five TX files totaling **8,978 rows** and same-day FX with **2 rows**.
 
 ---
 
@@ -35,17 +35,17 @@
 
 - Modify: `requirements-gcp.txt` — add pinned Pandas dependency.
 - Create: `pipeline/pandas_intake.py` — pure/source-focused Pandas validation, metadata shaping, deterministic IDs, anti-filter.
-- Modify: `pipeline/bigquery_adapter.py` — partition-scoped source-ID query, append-only load job, partition row count.
-- Create: `pipeline/raw_load.py` — one-date orchestration over the existing GCS/BigQuery adapters.
-- Create: `scripts/load_raw_batch.py` — thin CLI for one logical date.
-- Create: `tests/pipeline/test_pandas_intake.py` — credential-free Pandas/source contract tests.
-- Modify: `tests/pipeline/test_bigquery_adapter.py` — credential-free tests for the new narrow BigQuery methods.
-- Create: `tests/pipeline/test_raw_load.py` — stateful credential-free first-run/rerun orchestration tests.
-- Modify: `README.md` — minimum F04 one-date run and verification commands.
+- Modify: `pipeline/bigquery_adapter.py` — partition-scoped ID query, append-only load job, partition row count.
+- Create: `pipeline/raw_load.py` — one-date orchestration using the existing GCS/BigQuery adapters.
+- Create: `scripts/load_raw_batch.py` — thin CLI.
+- Create: `tests/pipeline/test_pandas_intake.py` — credential-free Pandas/source tests.
+- Modify: `tests/pipeline/test_bigquery_adapter.py` — credential-free tests for new BQ methods.
+- Create: `tests/pipeline/test_raw_load.py` — stateful first-run/rerun orchestration tests.
+- Modify: `README.md` — minimum F04 runbook.
 
 ---
 
-### Task 1: Add the Pure Pandas Intake Contract
+### Task 1: Add Pure Pandas Intake Logic
 
 **Files:**
 - Modify: `requirements-gcp.txt`
@@ -53,18 +53,18 @@
 - Create: `tests/pipeline/test_pandas_intake.py`
 
 **Interfaces:**
-- Consumes: canonical GCS object names, downloaded bytes, verified checksum metadata, `batch_date: datetime.date`, one invocation `ingested_at: datetime.datetime`.
-- Produces: `PandasIntakeError`, `EXPECTED_REGIONS`, `transaction_prefix(batch_date)`, `validate_transaction_objects(batch_date, object_names)`, `same_day_fx_object_name(batch_date)`, `verify_source_checksum(source_bytes, expected_checksum)`, `make_source_row_id(source_file, source_checksum, source_row_number)`, `prepare_transaction_frame(...)`, `prepare_fx_frame(...)`, `anti_filter_existing(frame, existing_ids)`.
+- Consumes: canonical GCS object names, source bytes, checksum metadata, `batch_date: date`, one `ingested_at: datetime`.
+- Produces: `PandasIntakeError`, `EXPECTED_REGIONS`, `transaction_prefix`, `validate_transaction_objects`, `same_day_fx_object_name`, `verify_source_checksum`, `make_source_row_id`, `prepare_transaction_frame`, `prepare_fx_frame`, `anti_filter_existing`.
 
-- [ ] **Step 1: Add the Pandas dependency and write the first failing tests**
+- [ ] **Step 1: Add Pandas and write discovery/checksum/source-ID tests**
 
-Append exactly this line to `requirements-gcp.txt`:
+Append to `requirements-gcp.txt`:
 
 ```text
 pandas==2.3.3
 ```
 
-Create `tests/pipeline/test_pandas_intake.py` with the discovery/source-identity tests first:
+Create `tests/pipeline/test_pandas_intake.py` with this initial content:
 
 ```python
 from __future__ import annotations
@@ -79,10 +79,7 @@ import pytest
 from pipeline.pandas_intake import (
     EXPECTED_REGIONS,
     PandasIntakeError,
-    anti_filter_existing,
     make_source_row_id,
-    prepare_fx_frame,
-    prepare_transaction_frame,
     same_day_fx_object_name,
     transaction_prefix,
     validate_transaction_objects,
@@ -99,57 +96,50 @@ def _sha256(data: bytes) -> str:
 
 
 def _tx_names(batch_date: date) -> list[str]:
-    compact = batch_date.strftime("%Y%m%d")
-    iso = batch_date.isoformat()
     return [
-        f"transactions/business_date={iso}/sales_{region}_{compact}.csv.gz"
+        (
+            f"transactions/business_date={batch_date.isoformat()}/"
+            f"sales_{region}_{batch_date:%Y%m%d}.csv.gz"
+        )
         for region in EXPECTED_REGIONS
     ]
 
 
-def test_transaction_prefix_and_expected_region_order_are_fixed():
-    batch_date = date(2025, 7, 22)
-
+def test_transaction_prefix_and_region_order_are_fixed():
+    d = date(2025, 7, 22)
     assert EXPECTED_REGIONS == (
-        "bkk",
-        "central",
-        "north",
-        "northeast",
-        "south",
+        "bkk", "central", "north", "northeast", "south"
     )
-    assert transaction_prefix(batch_date) == "transactions/business_date=2025-07-22/"
+    assert transaction_prefix(d) == "transactions/business_date=2025-07-22/"
 
 
 def test_five_canonical_transaction_objects_are_accepted():
-    batch_date = date(2025, 7, 22)
-
-    result = validate_transaction_objects(batch_date, _tx_names(batch_date))
-
+    d = date(2025, 7, 22)
+    result = validate_transaction_objects(d, _tx_names(d))
     assert tuple(result) == EXPECTED_REGIONS
     assert result["north"].endswith("sales_north_20250722.csv.gz")
 
 
-def test_missing_transaction_region_is_rejected():
-    batch_date = date(2025, 7, 22)
-    names = _tx_names(batch_date)[:-1]
-
+def test_missing_or_unexpected_transaction_object_is_rejected():
+    d = date(2025, 7, 22)
+    names = _tx_names(d)
     with pytest.raises(PandasIntakeError, match="Transaction object set mismatch"):
-        validate_transaction_objects(batch_date, names)
-
-
-def test_unexpected_or_duplicate_transaction_object_is_rejected():
-    batch_date = date(2025, 7, 22)
-    names = _tx_names(batch_date)
-    unexpected = (
-        "transactions/business_date=2025-07-22/"
-        "sales_unknown_20250722.csv.gz"
-    )
-
+        validate_transaction_objects(d, names[:-1])
     with pytest.raises(PandasIntakeError, match="Transaction object set mismatch"):
-        validate_transaction_objects(batch_date, [*names, unexpected])
+        validate_transaction_objects(
+            d,
+            [
+                *names,
+                "transactions/business_date=2025-07-22/sales_unknown_20250722.csv.gz",
+            ],
+        )
 
+
+def test_duplicate_transaction_object_is_rejected():
+    d = date(2025, 7, 22)
+    names = _tx_names(d)
     with pytest.raises(PandasIntakeError, match="Duplicate transaction object"):
-        validate_transaction_objects(batch_date, [*names, names[0]])
+        validate_transaction_objects(d, [*names, names[0]])
 
 
 def test_same_day_fx_object_name_is_canonical():
@@ -158,36 +148,24 @@ def test_same_day_fx_object_name_is_canonical():
     )
 
 
-def test_checksum_mismatch_and_missing_checksum_fail():
+def test_checksum_missing_mismatch_and_match():
     source = b"abc"
-
     with pytest.raises(PandasIntakeError, match="Missing source checksum metadata"):
         verify_source_checksum(source, "")
-
     with pytest.raises(PandasIntakeError, match="Source checksum mismatch"):
         verify_source_checksum(source, "0" * 64)
-
     assert verify_source_checksum(source, _sha256(source)) == _sha256(source)
 
 
 def test_source_row_id_is_stable_and_row_number_sensitive():
     checksum = "a" * 64
-    object_name = (
-        "transactions/business_date=2025-07-22/"
-        "sales_bkk_20250722.csv.gz"
-    )
-
+    object_name = _tx_names(date(2025, 7, 22))[0]
     first = make_source_row_id(object_name, checksum, 1)
-    repeated = make_source_row_id(object_name, checksum, 1)
-    second_row = make_source_row_id(object_name, checksum, 2)
-
-    assert first == repeated
-    assert first != second_row
+    assert first == make_source_row_id(object_name, checksum, 1)
+    assert first != make_source_row_id(object_name, checksum, 2)
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
-
-Run:
+- [ ] **Step 2: Run RED**
 
 ```powershell
 pip install -r requirements-gcp.txt
@@ -196,9 +174,9 @@ pytest tests/pipeline/test_pandas_intake.py -v
 
 Expected: collection/import failure because `pipeline.pandas_intake` does not exist.
 
-- [ ] **Step 3: Implement discovery, checksum, and deterministic source identity**
+- [ ] **Step 3: Implement only the discovery/checksum/source-ID slice**
 
-Create `pipeline/pandas_intake.py` with this initial content:
+Create `pipeline/pandas_intake.py`:
 
 ```python
 from __future__ import annotations
@@ -209,13 +187,7 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 
-EXPECTED_REGIONS = (
-    "bkk",
-    "central",
-    "north",
-    "northeast",
-    "south",
-)
+EXPECTED_REGIONS = ("bkk", "central", "north", "northeast", "south")
 TRANSACTION_SOURCE_COLUMNS = ("txn", "dtts", "amount", "currency")
 FX_SOURCE_COLUMNS = (
     "rate_date",
@@ -238,7 +210,7 @@ def transaction_prefix(batch_date: date) -> str:
 def _expected_transaction_name(batch_date: date, region: str) -> str:
     return (
         f"{transaction_prefix(batch_date)}"
-        f"sales_{region}_{batch_date.strftime('%Y%m%d')}.csv.gz"
+        f"sales_{region}_{batch_date:%Y%m%d}.csv.gz"
     )
 
 
@@ -248,7 +220,6 @@ def validate_transaction_objects(
 ) -> dict[str, str]:
     if len(object_names) != len(set(object_names)):
         raise PandasIntakeError("Duplicate transaction object discovered")
-
     expected = {
         region: _expected_transaction_name(batch_date, region)
         for region in EXPECTED_REGIONS
@@ -256,26 +227,19 @@ def validate_transaction_objects(
     expected_names = set(expected.values())
     actual_names = set(object_names)
     if actual_names != expected_names:
-        missing = sorted(expected_names - actual_names)
-        unexpected = sorted(actual_names - expected_names)
         raise PandasIntakeError(
             "Transaction object set mismatch: "
-            f"missing={missing} unexpected={unexpected}"
+            f"missing={sorted(expected_names - actual_names)} "
+            f"unexpected={sorted(actual_names - expected_names)}"
         )
     return expected
 
 
 def same_day_fx_object_name(batch_date: date) -> str:
-    return (
-        f"fx/{batch_date:%Y}/{batch_date:%m}/"
-        f"fx_{batch_date:%Y%m%d}.csv"
-    )
+    return f"fx/{batch_date:%Y}/{batch_date:%m}/fx_{batch_date:%Y%m%d}.csv"
 
 
-def verify_source_checksum(
-    source_bytes: bytes,
-    expected_checksum: str,
-) -> str:
+def verify_source_checksum(source_bytes: bytes, expected_checksum: str) -> str:
     if not expected_checksum:
         raise PandasIntakeError("Missing source checksum metadata")
     actual = hashlib.sha256(source_bytes).hexdigest()
@@ -296,70 +260,67 @@ def make_source_row_id(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 ```
 
-- [ ] **Step 4: Run the discovery/identity tests and confirm GREEN for this slice**
-
-Run:
+- [ ] **Step 4: Run GREEN for the first slice**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py -v
 ```
 
-Expected: the discovery/checksum/source-ID tests pass; frame-preparation imports still exist but their tests have not been added yet.
+Expected: all current tests pass.
 
-- [ ] **Step 5: Add failing transaction-frame tests**
+- [ ] **Step 5: Add transaction-frame imports and failing tests**
 
-Append to `tests/pipeline/test_pandas_intake.py`:
+Replace the import block from `pipeline.pandas_intake` in the test file with:
+
+```python
+from pipeline.pandas_intake import (
+    EXPECTED_REGIONS,
+    PandasIntakeError,
+    make_source_row_id,
+    prepare_transaction_frame,
+    same_day_fx_object_name,
+    transaction_prefix,
+    validate_transaction_objects,
+    verify_source_checksum,
+)
+```
+
+Append:
 
 ```python
 
 def test_transaction_frame_enforces_exact_header():
-    batch_date = date(2025, 7, 22)
-    source = _gzip_csv("txn,dtts,wrong,currency\nT1,2025-07-22 01:00:00,10,THB\n")
-
+    d = date(2025, 7, 22)
+    source = _gzip_csv(
+        "txn,dtts,wrong,currency\nT1,2025-07-22 01:00:00,10,THB\n"
+    )
     with pytest.raises(PandasIntakeError, match="Transaction header mismatch"):
         prepare_transaction_frame(
             source_bytes=source,
-            source_file=_tx_names(batch_date)[0],
+            source_file=_tx_names(d)[0],
             source_checksum=_sha256(source),
             region="bkk",
-            batch_date=batch_date,
+            batch_date=d,
             ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
         )
 
 
 def test_transaction_frame_preserves_dirty_strings_and_metadata():
-    batch_date = date(2025, 7, 22)
+    d = date(2025, 7, 22)
     source = _gzip_csv(
         "txn,dtts,amount,currency\n"
         "T1,not-a-time,N/A,usd\n"
         "T1,,N/A,usd\n"
     )
     checksum = _sha256(source)
-    object_name = _tx_names(batch_date)[0]
-    ingested_at = datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc)
-
     frame = prepare_transaction_frame(
         source_bytes=source,
-        source_file=object_name,
+        source_file=_tx_names(d)[0],
         source_checksum=checksum,
         region="bkk",
-        batch_date=batch_date,
-        ingested_at=ingested_at,
+        batch_date=d,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
     )
-
-    assert list(frame.columns) == [
-        "txn",
-        "dtts",
-        "amount",
-        "currency",
-        "region",
-        "source_file",
-        "source_checksum",
-        "source_row_number",
-        "source_row_id",
-        "batch_date",
-        "ingested_at",
-    ]
     assert frame.loc[0, "amount"] == "N/A"
     assert frame.loc[0, "dtts"] == "not-a-time"
     assert frame.loc[1, "dtts"] == ""
@@ -373,17 +334,15 @@ def test_transaction_frame_preserves_dirty_strings_and_metadata():
     ]
 ```
 
-- [ ] **Step 6: Run the transaction-frame tests and confirm RED**
-
-Run:
+- [ ] **Step 6: Run RED for transaction shaping**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py -v
 ```
 
-Expected: FAIL because `prepare_transaction_frame` is not implemented.
+Expected: import failure because `prepare_transaction_frame` does not exist.
 
-- [ ] **Step 7: Implement transaction Pandas shaping without business cleaning**
+- [ ] **Step 7: Implement transaction shaping**
 
 Append to `pipeline/pandas_intake.py`:
 
@@ -392,10 +351,8 @@ Append to `pipeline/pandas_intake.py`:
 def _utc_text(value: datetime) -> str:
     if value.tzinfo is None:
         raise PandasIntakeError("ingested_at must be timezone-aware")
-    return (
-        value.astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
     )
 
 
@@ -450,53 +407,51 @@ def prepare_transaction_frame(
     return frame
 ```
 
-- [ ] **Step 8: Run transaction-frame tests and confirm GREEN**
-
-Run:
+- [ ] **Step 8: Run transaction GREEN**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py -v
 ```
 
-Expected: transaction header/raw-string/metadata tests pass.
+Expected: all current tests pass.
 
-- [ ] **Step 9: Add failing FX and anti-filter tests**
+- [ ] **Step 9: Add FX/anti-filter imports and failing tests**
 
-Append to `tests/pipeline/test_pandas_intake.py`:
+Replace the import block again with:
+
+```python
+from pipeline.pandas_intake import (
+    EXPECTED_REGIONS,
+    PandasIntakeError,
+    anti_filter_existing,
+    make_source_row_id,
+    prepare_fx_frame,
+    prepare_transaction_frame,
+    same_day_fx_object_name,
+    transaction_prefix,
+    validate_transaction_objects,
+    verify_source_checksum,
+)
+```
+
+Append:
 
 ```python
 
-def test_fx_frame_enforces_header_and_preserves_raw_rate_date():
-    batch_date = date(2025, 7, 22)
-    object_name = same_day_fx_object_name(batch_date)
+def test_fx_frame_preserves_raw_rate_date():
+    d = date(2025, 7, 22)
     source = (
         "rate_date,currency,mid_rate,rate_unit,source_provider,source_url\n"
         "2025-07-22,USD,32.40,THB_PER_FOREIGN,BOT,https://example.test/usd\n"
         "2025-07-22,EUR,37.90,THB_PER_FOREIGN,BOT,https://example.test/eur\n"
     ).encode("utf-8")
-
     frame = prepare_fx_frame(
         source_bytes=source,
-        source_file=object_name,
+        source_file=same_day_fx_object_name(d),
         source_checksum=_sha256(source),
-        rate_date=batch_date,
+        rate_date=d,
         ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
     )
-
-    assert list(frame.columns) == [
-        "rate_date_raw",
-        "currency",
-        "mid_rate",
-        "rate_unit",
-        "source_provider",
-        "source_url",
-        "source_file",
-        "source_checksum",
-        "source_row_number",
-        "source_row_id",
-        "rate_date",
-        "ingested_at",
-    ]
     assert frame["rate_date_raw"].tolist() == ["2025-07-22", "2025-07-22"]
     assert frame["rate_date"].tolist() == ["2025-07-22", "2025-07-22"]
     assert frame["source_row_number"].tolist() == [1, 2]
@@ -504,7 +459,6 @@ def test_fx_frame_enforces_header_and_preserves_raw_rate_date():
 
 def test_fx_header_mismatch_fails():
     source = b"wrong,currency,mid_rate,rate_unit,source_provider,source_url\n"
-
     with pytest.raises(PandasIntakeError, match="FX header mismatch"):
         prepare_fx_frame(
             source_bytes=source,
@@ -517,31 +471,24 @@ def test_fx_header_mismatch_fails():
 
 def test_anti_filter_keeps_only_unseen_source_rows():
     frame = pd.DataFrame(
-        {
-            "source_row_id": ["id-a", "id-b", "id-c"],
-            "amount": ["1", "2", "3"],
-        }
+        {"source_row_id": ["id-a", "id-b", "id-c"], "amount": ["1", "2", "3"]}
     )
-
     result = anti_filter_existing(frame, {"id-a", "id-c"})
-
     assert result["source_row_id"].tolist() == ["id-b"]
     assert result.index.tolist() == [0]
 ```
 
-- [ ] **Step 10: Run focused tests and confirm RED**
-
-Run:
+- [ ] **Step 10: Run FX/anti-filter RED**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py -v
 ```
 
-Expected: FAIL because FX preparation and anti-filter are not implemented.
+Expected: import failure because `prepare_fx_frame` and `anti_filter_existing` do not exist.
 
-- [ ] **Step 11: Implement FX shaping and Pandas anti-filter**
+- [ ] **Step 11: Implement FX shaping and anti-filter**
 
-Append to `pipeline/pandas_intake.py`:
+Append:
 
 ```python
 
@@ -584,43 +531,38 @@ def anti_filter_existing(
     )
 ```
 
-- [ ] **Step 12: Run the full Pandas intake test file and confirm GREEN**
-
-Run:
+- [ ] **Step 12: Run Task 1 GREEN and commit**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py -v
-```
-
-Expected: all Task 1 tests pass.
-
-- [ ] **Step 13: Commit Task 1**
-
-```powershell
 git add requirements-gcp.txt pipeline/pandas_intake.py tests/pipeline/test_pandas_intake.py
 git commit -m "feat: add Pandas raw intake shaping"
 ```
 
+Expected: all Task 1 tests pass before commit.
+
 ---
 
-### Task 2: Extend the BigQuery Adapter for Partition-Scoped Idempotent Appends
+### Task 2: Extend BigQuery Adapter for Partition-Scoped Raw Loading
 
 **Files:**
 - Modify: `pipeline/bigquery_adapter.py`
 - Modify: `tests/pipeline/test_bigquery_adapter.py`
 
 **Interfaces:**
-- Consumes: fixed dataset/table/partition names from the F03 contract, `partition_date: datetime.date`, prepared JSON-compatible row dictionaries, exact F03 schemas.
-- Produces: `query_source_row_ids(dataset_id, table_id, partition_field, partition_date) -> set[str]`, `append_rows(dataset_id, table_id, rows, schema) -> int`, `query_partition_row_count(dataset_id, table_id, partition_field, partition_date) -> int`.
+- Produces: `query_source_row_ids(..., partition_date) -> set[str]`, `append_rows(..., rows, schema) -> int`, `query_partition_row_count(..., partition_date) -> int`.
 
-- [ ] **Step 1: Upgrade the credential-free fake client and add failing query/append tests**
+- [ ] **Step 1: Replace credential-free fakes with a query/load-aware version**
 
-Modify the test fakes at the top of `tests/pipeline/test_bigquery_adapter.py` so query calls and load calls can be inspected without breaking the existing scalar-query test:
+At the top of `tests/pipeline/test_bigquery_adapter.py`, add:
 
 ```python
 from datetime import date
+```
 
+Replace `FakeQueryJob` and `FakeClient` with this exact block, preserving the existing test functions below it:
 
+```python
 class FakeQueryJob:
     def __init__(self, rows):
         self._rows = rows
@@ -643,15 +585,29 @@ class FakeClient:
         self.query_calls = []
         self.load_calls = []
 
-    # keep existing get/create dataset/table methods unchanged
+    def get_dataset(self, full_id):
+        if full_id not in self.datasets:
+            raise NotFound("missing dataset")
+        return self.datasets[full_id]
+
+    def create_dataset(self, dataset):
+        ref = dataset.reference
+        self.datasets[f"{ref.project}.{ref.dataset_id}"] = dataset
+        return dataset
+
+    def get_table(self, full_id):
+        if full_id not in self.tables:
+            raise NotFound("missing table")
+        return self.tables[full_id]
+
+    def create_table(self, table):
+        ref = table.reference
+        self.tables[f"{ref.project}.{ref.dataset_id}.{ref.table_id}"] = table
+        return table
 
     def query(self, sql, job_config=None):
         self.query_calls.append((sql, job_config))
-        rows = (
-            self.query_rows
-            if self.query_rows is not None
-            else [(self.query_value,)]
-        )
+        rows = self.query_rows if self.query_rows is not None else [(self.query_value,)]
         return FakeQueryJob(rows)
 
     def load_table_from_json(self, rows, destination, job_config=None):
@@ -659,7 +615,9 @@ class FakeClient:
         return FakeLoadJob()
 ```
 
-Append these tests:
+- [ ] **Step 2: Add failing adapter tests**
+
+Append:
 
 ```python
 
@@ -667,19 +625,13 @@ def test_query_source_row_ids_is_partition_scoped():
     client = FakeClient()
     client.query_rows = [("id-a",), ("id-b",)]
     adapter = BigQueryAdapter("proj", client=client)
-
     result = adapter.query_source_row_ids(
-        "bahtflow_raw",
-        "transactions",
-        "batch_date",
-        date(2025, 7, 22),
+        "bahtflow_raw", "transactions", "batch_date", date(2025, 7, 22)
     )
-
     assert result == {"id-a", "id-b"}
     sql, job_config = client.query_calls[-1]
     assert "`proj.bahtflow_raw.transactions`" in sql
     assert "WHERE batch_date = @partition_date" in sql
-    assert len(job_config.query_parameters) == 1
     parameter = job_config.query_parameters[0]
     assert parameter.name == "partition_date"
     assert parameter.type_ == "DATE"
@@ -691,28 +643,19 @@ def test_append_rows_uses_write_append_load_job():
     adapter = BigQueryAdapter("proj", client=client)
     schema = (bigquery.SchemaField("source_row_id", "STRING", mode="REQUIRED"),)
     rows = [{"source_row_id": "id-a"}, {"source_row_id": "id-b"}]
-
-    inserted = adapter.append_rows(
-        "bahtflow_raw",
-        "transactions",
-        rows,
-        schema,
-    )
-
-    assert inserted == 2
+    assert adapter.append_rows("bahtflow_raw", "transactions", rows, schema) == 2
     loaded_rows, destination, job_config = client.load_calls[-1]
     assert loaded_rows == rows
     assert destination == "proj.bahtflow_raw.transactions"
     assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
-    assert [(field.name, field.field_type, field.mode) for field in job_config.schema] == [
+    assert [(f.name, f.field_type, f.mode) for f in job_config.schema] == [
         ("source_row_id", "STRING", "REQUIRED")
     ]
 
 
-def test_append_rows_skips_empty_input_without_load_job():
+def test_append_rows_skips_empty_input():
     client = FakeClient()
     adapter = BigQueryAdapter("proj", client=client)
-
     assert adapter.append_rows("bahtflow_raw", "transactions", [], ()) == 0
     assert client.load_calls == []
 
@@ -721,14 +664,9 @@ def test_query_partition_row_count_is_partition_scoped():
     client = FakeClient()
     client.query_rows = [(8978,)]
     adapter = BigQueryAdapter("proj", client=client)
-
     count = adapter.query_partition_row_count(
-        "bahtflow_raw",
-        "transactions",
-        "batch_date",
-        date(2025, 7, 22),
+        "bahtflow_raw", "transactions", "batch_date", date(2025, 7, 22)
     )
-
     assert count == 8978
     sql, job_config = client.query_calls[-1]
     assert "SELECT COUNT(*)" in sql
@@ -736,32 +674,30 @@ def test_query_partition_row_count_is_partition_scoped():
     assert job_config.query_parameters[0].value == date(2025, 7, 22)
 ```
 
-- [ ] **Step 2: Run the new adapter tests and confirm RED**
-
-Run:
+- [ ] **Step 3: Run RED**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py -v
 ```
 
-Expected: FAIL because the three new adapter methods do not exist.
+Expected: new tests fail because the new methods do not exist.
 
-- [ ] **Step 3: Implement the narrow BigQuery methods**
+- [ ] **Step 4: Implement the narrow methods**
 
-Modify `pipeline/bigquery_adapter.py` by importing `date` and appending these methods inside `BigQueryAdapter`:
+Add to imports in `pipeline/bigquery_adapter.py`:
 
 ```python
 from datetime import date
 ```
+
+Append these methods inside `BigQueryAdapter`:
 
 ```python
     def _partition_job_config(self, partition_date: date):
         return bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter(
-                    "partition_date",
-                    "DATE",
-                    partition_date,
+                    "partition_date", "DATE", partition_date
                 )
             ]
         )
@@ -799,9 +735,7 @@ from datetime import date
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         )
         self._client.load_table_from_json(
-            rows,
-            full_id,
-            job_config=job_config,
+            rows, full_id, job_config=job_config
         ).result()
         return len(rows)
 
@@ -824,28 +758,19 @@ from datetime import date
         return int(next(iter(rows))[0])
 ```
 
-The dataset/table/partition identifiers passed to these methods come only from fixed application contract constants, while the date is parameterized.
-
-- [ ] **Step 4: Run the full adapter and contract tests and confirm GREEN**
-
-Run:
+- [ ] **Step 5: Run GREEN and commit**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py tests/pipeline/test_bigquery_contract.py -v
-```
-
-Expected: all F03 and F04 adapter/contract tests pass.
-
-- [ ] **Step 5: Commit Task 2**
-
-```powershell
 git add pipeline/bigquery_adapter.py tests/pipeline/test_bigquery_adapter.py
 git commit -m "feat: add partition-scoped raw load adapter"
 ```
 
+Expected: all adapter/contract tests pass before commit.
+
 ---
 
-### Task 3: Build the One-Date Raw Load Orchestration and CLI
+### Task 3: Add One-Date Raw Load Orchestration and CLI
 
 **Files:**
 - Create: `pipeline/raw_load.py`
@@ -853,10 +778,9 @@ git commit -m "feat: add partition-scoped raw load adapter"
 - Create: `tests/pipeline/test_raw_load.py`
 
 **Interfaces:**
-- Consumes: `GcsAdapter` methods from F02, `BigQueryAdapter` methods from Task 2, F03 raw schemas/partition fields, Task 1 Pandas intake functions, existing `load_gcp_settings()`.
-- Produces: `RawLoadSummary`, `load_raw_batch(batch_date, bucket_name, gcs_adapter, bigquery_adapter, ingested_at=None) -> RawLoadSummary`, and `python -m scripts.load_raw_batch --batch-date YYYY-MM-DD`.
+- Produces: `RawLoadSummary`, `load_raw_batch(...)->RawLoadSummary`, `python -m scripts.load_raw_batch --batch-date YYYY-MM-DD`.
 
-- [ ] **Step 1: Write credential-free orchestration tests with stateful fakes**
+- [ ] **Step 1: Write stateful first-run/rerun tests**
 
 Create `tests/pipeline/test_raw_load.py`:
 
@@ -876,10 +800,10 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _tx_object(batch_date: date, region: str) -> str:
+def _tx_object(d: date, region: str) -> str:
     return (
-        f"transactions/business_date={batch_date.isoformat()}/"
-        f"sales_{region}_{batch_date:%Y%m%d}.csv.gz"
+        f"transactions/business_date={d.isoformat()}/"
+        f"sales_{region}_{d:%Y%m%d}.csv.gz"
     )
 
 
@@ -915,105 +839,86 @@ class FakeBigQueryAdapter:
         }
 
     def query_source_row_ids(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
+        self, dataset_id, table_id, partition_field, partition_date
     ):
         return set(self.ids[(table_id, partition_date.isoformat())])
 
     def append_rows(self, dataset_id, table_id, rows, schema):
-        key_date = rows[0]["batch_date"] if table_id == "transactions" else rows[0]["rate_date"]
+        if not rows:
+            return 0
+        key_date = (
+            rows[0]["batch_date"]
+            if table_id == "transactions"
+            else rows[0]["rate_date"]
+        )
         key = (table_id, key_date)
         self.rows[key].extend(rows)
         self.ids[key].update(row["source_row_id"] for row in rows)
         return len(rows)
 
     def query_partition_row_count(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
+        self, dataset_id, table_id, partition_field, partition_date
     ):
         return len(self.rows[(table_id, partition_date.isoformat())])
 
 
-def _objects_with_fx(batch_date: date) -> dict[str, bytes]:
+def _objects_with_fx(d: date) -> dict[str, bytes]:
     objects = {}
     for region in ("bkk", "central", "north", "northeast", "south"):
-        objects[_tx_object(batch_date, region)] = gzip.compress(
+        objects[_tx_object(d, region)] = gzip.compress(
             (
                 "txn,dtts,amount,currency\n"
                 f"{region}-1,not-a-time,N/A,usd\n"
             ).encode("utf-8")
         )
-    fx_name = f"fx/{batch_date:%Y}/{batch_date:%m}/fx_{batch_date:%Y%m%d}.csv"
+    fx_name = f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"
     objects[fx_name] = (
         "rate_date,currency,mid_rate,rate_unit,source_provider,source_url\n"
-        f"{batch_date.isoformat()},USD,32.4,THB_PER_FOREIGN,BOT,https://example.test/usd\n"
-        f"{batch_date.isoformat()},EUR,37.9,THB_PER_FOREIGN,BOT,https://example.test/eur\n"
+        f"{d.isoformat()},USD,32.4,THB_PER_FOREIGN,BOT,https://example.test/usd\n"
+        f"{d.isoformat()},EUR,37.9,THB_PER_FOREIGN,BOT,https://example.test/eur\n"
     ).encode("utf-8")
     return objects
 
 
-def test_first_run_loads_and_second_run_inserts_zero_rows():
-    batch_date = date(2025, 7, 22)
-    gcs = FakeGcsAdapter(_objects_with_fx(batch_date))
+def test_first_run_loads_and_rerun_inserts_zero_rows():
+    d = date(2025, 7, 22)
+    gcs = FakeGcsAdapter(_objects_with_fx(d))
     bq = FakeBigQueryAdapter()
-    ingested_at = datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc)
-
     first = load_raw_batch(
-        batch_date=batch_date,
-        bucket_name="bucket",
-        gcs_adapter=gcs,
-        bigquery_adapter=bq,
-        ingested_at=ingested_at,
-    )
-    second = load_raw_batch(
-        batch_date=batch_date,
-        bucket_name="bucket",
-        gcs_adapter=gcs,
-        bigquery_adapter=bq,
-        ingested_at=datetime(2025, 7, 22, 3, 0, tzinfo=timezone.utc),
-    )
-
-    assert first.tx_files == 5
-    assert first.tx_source_rows == 5
-    assert first.tx_inserted_rows == 5
-    assert first.tx_partition_rows == 5
-    assert first.fx_status == "LOADED"
-    assert first.fx_source_rows == 2
-    assert first.fx_inserted_rows == 2
-    assert first.fx_partition_rows == 2
-
-    assert second.tx_inserted_rows == 0
-    assert second.tx_partition_rows == 5
-    assert second.fx_status == "LOADED"
-    assert second.fx_inserted_rows == 0
-    assert second.fx_partition_rows == 2
-
-    assert bq.rows[("transactions", "2025-07-22")][0]["amount"] == "N/A"
-    assert bq.rows[("transactions", "2025-07-22")][0]["dtts"] == "not-a-time"
-
-
-def test_missing_same_day_fx_returns_no_new_rate_without_failing_tx():
-    batch_date = date(2025, 7, 22)
-    objects = _objects_with_fx(batch_date)
-    fx_name = f"fx/{batch_date:%Y}/{batch_date:%m}/fx_{batch_date:%Y%m%d}.csv"
-    del objects[fx_name]
-    gcs = FakeGcsAdapter(objects)
-    bq = FakeBigQueryAdapter()
-
-    summary = load_raw_batch(
-        batch_date=batch_date,
+        batch_date=d,
         bucket_name="bucket",
         gcs_adapter=gcs,
         bigquery_adapter=bq,
         ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
     )
+    second = load_raw_batch(
+        batch_date=d,
+        bucket_name="bucket",
+        gcs_adapter=gcs,
+        bigquery_adapter=bq,
+        ingested_at=datetime(2025, 7, 22, 3, 0, tzinfo=timezone.utc),
+    )
+    assert (first.tx_files, first.tx_source_rows, first.tx_inserted_rows) == (5, 5, 5)
+    assert (first.fx_status, first.fx_source_rows, first.fx_inserted_rows) == (
+        "LOADED", 2, 2
+    )
+    assert (second.tx_inserted_rows, second.tx_partition_rows) == (0, 5)
+    assert (second.fx_inserted_rows, second.fx_partition_rows) == (0, 2)
+    assert bq.rows[("transactions", "2025-07-22")][0]["amount"] == "N/A"
+    assert bq.rows[("transactions", "2025-07-22")][0]["dtts"] == "not-a-time"
 
+
+def test_missing_same_day_fx_returns_no_new_rate():
+    d = date(2025, 7, 22)
+    objects = _objects_with_fx(d)
+    del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
+    summary = load_raw_batch(
+        batch_date=d,
+        bucket_name="bucket",
+        gcs_adapter=FakeGcsAdapter(objects),
+        bigquery_adapter=FakeBigQueryAdapter(),
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
     assert summary.tx_inserted_rows == 5
     assert summary.fx_status == "NO_NEW_RATE"
     assert summary.fx_source_rows == 0
@@ -1021,9 +926,7 @@ def test_missing_same_day_fx_returns_no_new_rate_without_failing_tx():
     assert summary.fx_partition_rows == 0
 ```
 
-- [ ] **Step 2: Run the orchestration tests and confirm RED**
-
-Run:
+- [ ] **Step 2: Run RED**
 
 ```powershell
 pytest tests/pipeline/test_raw_load.py -v
@@ -1031,7 +934,7 @@ pytest tests/pipeline/test_raw_load.py -v
 
 Expected: collection/import failure because `pipeline.raw_load` does not exist.
 
-- [ ] **Step 3: Implement the one-date orchestration**
+- [ ] **Step 3: Implement one-date orchestration**
 
 Create `pipeline/raw_load.py`:
 
@@ -1082,16 +985,9 @@ def _required_checksum(metadata) -> str:
     return checksum
 
 
-def _load_tx_frame(
-    *,
-    batch_date: date,
-    bucket_name: str,
-    gcs_adapter,
-    ingested_at: datetime,
-) -> pd.DataFrame:
+def _load_tx_frame(*, batch_date, bucket_name, gcs_adapter, ingested_at):
     names = gcs_adapter.list_object_names(
-        bucket_name,
-        prefix=transaction_prefix(batch_date),
+        bucket_name, prefix=transaction_prefix(batch_date)
     )
     by_region = validate_transaction_objects(batch_date, names)
     frames = []
@@ -1102,13 +998,12 @@ def _load_tx_frame(
             raise PandasIntakeError(
                 f"Discovered transaction object disappeared: {object_name}"
             )
-        checksum = _required_checksum(metadata)
         source_bytes = gcs_adapter.download_bytes(bucket_name, object_name)
         frames.append(
             prepare_transaction_frame(
                 source_bytes=source_bytes,
                 source_file=object_name,
-                source_checksum=checksum,
+                source_checksum=_required_checksum(metadata),
                 region=region,
                 batch_date=batch_date,
                 ingested_at=ingested_at,
@@ -1117,28 +1012,18 @@ def _load_tx_frame(
     return pd.concat(frames, ignore_index=True)
 
 
-def _load_fx_frame(
-    *,
-    batch_date: date,
-    bucket_name: str,
-    gcs_adapter,
-    ingested_at: datetime,
-):
+def _load_fx_frame(*, batch_date, bucket_name, gcs_adapter, ingested_at):
     object_name = same_day_fx_object_name(batch_date)
     metadata = gcs_adapter.get_object_metadata(bucket_name, object_name)
     if not metadata.exists:
         return "NO_NEW_RATE", pd.DataFrame()
-    checksum = _required_checksum(metadata)
     source_bytes = gcs_adapter.download_bytes(bucket_name, object_name)
-    return (
-        "LOADED",
-        prepare_fx_frame(
-            source_bytes=source_bytes,
-            source_file=object_name,
-            source_checksum=checksum,
-            rate_date=batch_date,
-            ingested_at=ingested_at,
-        ),
+    return "LOADED", prepare_fx_frame(
+        source_bytes=source_bytes,
+        source_file=object_name,
+        source_checksum=_required_checksum(metadata),
+        rate_date=batch_date,
+        ingested_at=ingested_at,
     )
 
 
@@ -1151,7 +1036,6 @@ def load_raw_batch(
     ingested_at: datetime | None = None,
 ) -> RawLoadSummary:
     invocation_time = ingested_at or datetime.now(timezone.utc)
-
     tx_frame = _load_tx_frame(
         batch_date=batch_date,
         bucket_name=bucket_name,
@@ -1159,10 +1043,7 @@ def load_raw_batch(
         ingested_at=invocation_time,
     )
     tx_existing = bigquery_adapter.query_source_row_ids(
-        "bahtflow_raw",
-        "transactions",
-        TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        "bahtflow_raw", "transactions", TRANSACTIONS_PARTITION_FIELD, batch_date
     )
     tx_new = anti_filter_existing(tx_frame, tx_existing)
     tx_inserted = bigquery_adapter.append_rows(
@@ -1172,10 +1053,7 @@ def load_raw_batch(
         TRANSACTIONS_SCHEMA,
     )
     tx_partition_rows = bigquery_adapter.query_partition_row_count(
-        "bahtflow_raw",
-        "transactions",
-        TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        "bahtflow_raw", "transactions", TRANSACTIONS_PARTITION_FIELD, batch_date
     )
 
     fx_status, fx_frame = _load_fx_frame(
@@ -1187,10 +1065,7 @@ def load_raw_batch(
     fx_inserted = 0
     if fx_status == "LOADED":
         fx_existing = bigquery_adapter.query_source_row_ids(
-            "bahtflow_raw",
-            "fx_rates",
-            FX_RATES_PARTITION_FIELD,
-            batch_date,
+            "bahtflow_raw", "fx_rates", FX_RATES_PARTITION_FIELD, batch_date
         )
         fx_new = anti_filter_existing(fx_frame, fx_existing)
         fx_inserted = bigquery_adapter.append_rows(
@@ -1200,10 +1075,7 @@ def load_raw_batch(
             FX_RATES_SCHEMA,
         )
     fx_partition_rows = bigquery_adapter.query_partition_row_count(
-        "bahtflow_raw",
-        "fx_rates",
-        FX_RATES_PARTITION_FIELD,
-        batch_date,
+        "bahtflow_raw", "fx_rates", FX_RATES_PARTITION_FIELD, batch_date
     )
 
     return RawLoadSummary(
@@ -1219,17 +1091,15 @@ def load_raw_batch(
     )
 ```
 
-- [ ] **Step 4: Run the orchestration tests and confirm GREEN**
-
-Run:
+- [ ] **Step 4: Run orchestration GREEN**
 
 ```powershell
 pytest tests/pipeline/test_raw_load.py -v
 ```
 
-Expected: both first-run/rerun and `NO_NEW_RATE` tests pass.
+Expected: both orchestration tests pass.
 
-- [ ] **Step 5: Add the thin CLI**
+- [ ] **Step 5: Add thin CLI**
 
 Create `scripts/load_raw_batch.py`:
 
@@ -1260,119 +1130,96 @@ def main() -> None:
         gcs_adapter=GcsAdapter(settings.project_id),
         bigquery_adapter=BigQueryAdapter(settings.project_id),
     )
-    print(f"batch_date={summary.batch_date}")
-    print(f"tx_files={summary.tx_files}")
-    print(f"tx_source_rows={summary.tx_source_rows}")
-    print(f"tx_inserted_rows={summary.tx_inserted_rows}")
-    print(f"tx_partition_rows={summary.tx_partition_rows}")
-    print(f"fx_status={summary.fx_status}")
-    print(f"fx_source_rows={summary.fx_source_rows}")
-    print(f"fx_inserted_rows={summary.fx_inserted_rows}")
-    print(f"fx_partition_rows={summary.fx_partition_rows}")
+    for key, value in (
+        ("batch_date", summary.batch_date),
+        ("tx_files", summary.tx_files),
+        ("tx_source_rows", summary.tx_source_rows),
+        ("tx_inserted_rows", summary.tx_inserted_rows),
+        ("tx_partition_rows", summary.tx_partition_rows),
+        ("fx_status", summary.fx_status),
+        ("fx_source_rows", summary.fx_source_rows),
+        ("fx_inserted_rows", summary.fx_inserted_rows),
+        ("fx_partition_rows", summary.fx_partition_rows),
+    ):
+        print(f"{key}={value}")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 6: Run all F04 credential-free tests and compile checks**
-
-Run:
+- [ ] **Step 6: Run focused tests/static checks and commit**
 
 ```powershell
 pytest tests/pipeline/test_pandas_intake.py `
        tests/pipeline/test_bigquery_adapter.py `
        tests/pipeline/test_bigquery_contract.py `
        tests/pipeline/test_raw_load.py -v
-
 python -m py_compile `
   pipeline/pandas_intake.py `
   pipeline/raw_load.py `
   pipeline/bigquery_adapter.py `
   scripts/load_raw_batch.py
-```
-
-Expected: focused tests have 0 failures and compile emits no output.
-
-- [ ] **Step 7: Commit Task 3**
-
-```powershell
 git add pipeline/raw_load.py scripts/load_raw_batch.py tests/pipeline/test_raw_load.py
 git commit -m "feat: load one raw batch idempotently"
 ```
 
+Expected: focused tests pass and compile emits no output before commit.
+
 ---
 
-### Task 4: Run Live One-Date Acceptance and Add the Thin F04 Runbook
+### Task 4: Live One-Date Acceptance and Thin Runbook
 
 **Files:**
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: the complete F04 CLI and existing GCP runtime configuration.
-- Produces: reproducible first-run/rerun evidence for `2025-07-22` and minimum operator documentation.
+- Consumes: completed F04 CLI and current GCP runtime.
+- Produces: reproducible first-run/rerun evidence for `2025-07-22`.
 
-- [ ] **Step 1: Sync the local F04 branch and rebuild the GCP toolbox**
-
-Run:
+- [ ] **Step 1: Sync/rebuild and run full local gate**
 
 ```powershell
 git switch feat/04-pandas-intake
 git pull --ff-only origin feat/04-pandas-intake
 pip install -r requirements-gcp.txt
-
 docker compose --profile gcp build gcp-toolbox
-```
-
-Expected: Pandas installs locally and into the toolbox image with no dependency errors.
-
-- [ ] **Step 2: Run full credential-free verification before touching live raw tables**
-
-Run:
-
-```powershell
 pytest
-
 python -m py_compile `
   pipeline/pandas_intake.py `
   pipeline/raw_load.py `
   pipeline/bigquery_adapter.py `
   scripts/load_raw_batch.py
-
 docker compose config --quiet
 git diff --check
 ```
 
-Expected: pytest has 0 failures; compile/Compose/diff checks emit no errors.
+Expected: 0 test failures and no static-check errors.
 
-- [ ] **Step 3: Confirm the acceptance partition is empty before the first live load**
-
-Run:
+- [ ] **Step 2: Prove acceptance partitions start empty**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "from pipeline.config import load_gcp_settings; from pipeline.bigquery_adapter import BigQueryAdapter; from datetime import date; s=load_gcp_settings(); a=BigQueryAdapter(s.project_id); d=date(2025,7,22); print('tx_before=', a.query_partition_row_count('bahtflow_raw','transactions','batch_date',d)); print('fx_before=', a.query_partition_row_count('bahtflow_raw','fx_rates','rate_date',d))"
+  python -c "from pipeline.config import load_gcp_settings; from pipeline.bigquery_adapter import BigQueryAdapter; from datetime import date; s=load_gcp_settings(); a=BigQueryAdapter(s.project_id); d=date(2025,7,22); print('tx_before=',a.query_partition_row_count('bahtflow_raw','transactions','batch_date',d)); print('fx_before=',a.query_partition_row_count('bahtflow_raw','fx_rates','rate_date',d))"
 ```
 
-Required for a clean F04 acceptance run:
+Required:
 
 ```text
 tx_before= 0
 fx_before= 0
 ```
 
-If either count is nonzero, stop. Do not delete or truncate live data automatically. Investigate whether a previous F04 attempt populated the partition and decide explicitly how to proceed.
+If nonzero, stop; do not truncate/delete automatically.
 
-- [ ] **Step 4: Run the first live load for `2025-07-22`**
-
-Run:
+- [ ] **Step 3: First live load**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.load_raw_batch --batch-date 2025-07-22
 ```
 
-Required transaction evidence from the committed manifest:
+Required:
 
 ```text
 batch_date=2025-07-22
@@ -1386,16 +1233,9 @@ fx_inserted_rows=2
 fx_partition_rows=2
 ```
 
-- [ ] **Step 5: Run the exact same logical date again and prove idempotency**
+- [ ] **Step 4: Exact rerun idempotency proof**
 
-Run:
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -m scripts.load_raw_batch --batch-date 2025-07-22
-```
-
-Required rerun evidence:
+Run the same command again. Required:
 
 ```text
 batch_date=2025-07-22
@@ -1409,26 +1249,22 @@ fx_inserted_rows=0
 fx_partition_rows=2
 ```
 
-- [ ] **Step 6: Verify one raw source row by deterministic source identity without business parsing**
-
-Use a credentialed container command that reconstructs the first BKK source row through the same Pandas intake and compares its raw business strings with BigQuery:
+- [ ] **Step 5: Compare one deterministic raw row with source strings**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "from datetime import date,datetime,timezone; from pipeline.config import load_gcp_settings; from pipeline.gcs_adapter import GcsAdapter; from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY; from pipeline.pandas_intake import prepare_transaction_frame; from google.cloud import bigquery; s=load_gcp_settings(); g=GcsAdapter(s.project_id); d=date(2025,7,22); o='transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz'; m=g.get_object_metadata(s.bucket_name,o); b=g.download_bytes(s.bucket_name,o); f=prepare_transaction_frame(source_bytes=b,source_file=o,source_checksum=m.metadata[SOURCE_SHA256_METADATA_KEY],region='bkk',batch_date=d,ingested_at=datetime.now(timezone.utc)); r=f.iloc[0]; c=bigquery.Client(project=s.project_id); q='SELECT txn,dtts,amount,currency FROM `'+s.project_id+'.bahtflow_raw.transactions` WHERE source_row_id=@id'; rows=list(c.query(q,job_config=bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter('id','STRING',r.source_row_id)])).result()); got=list(rows[0]); exp=[r.txn,r.dtts,r.amount,r.currency]; print('source_row_id=',r.source_row_id); print('raw_strings_match=',got==exp)"
+  python -c "from datetime import date,datetime,timezone; from pipeline.config import load_gcp_settings; from pipeline.gcs_adapter import GcsAdapter; from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY; from pipeline.pandas_intake import prepare_transaction_frame; from google.cloud import bigquery; s=load_gcp_settings(); g=GcsAdapter(s.project_id); d=date(2025,7,22); o='transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz'; m=g.get_object_metadata(s.bucket_name,o); b=g.download_bytes(s.bucket_name,o); f=prepare_transaction_frame(source_bytes=b,source_file=o,source_checksum=m.metadata[SOURCE_SHA256_METADATA_KEY],region='bkk',batch_date=d,ingested_at=datetime.now(timezone.utc)); r=f.iloc[0]; c=bigquery.Client(project=s.project_id); q='SELECT txn,dtts,amount,currency FROM `'+s.project_id+'.bahtflow_raw.transactions` WHERE source_row_id=@id'; rows=list(c.query(q,job_config=bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter('id','STRING',r.source_row_id)])).result()); print('raw_strings_match=',list(rows[0])==[r.txn,r.dtts,r.amount,r.currency])"
 ```
 
-Required evidence:
+Required:
 
 ```text
 raw_strings_match=True
 ```
 
-This verifies source-string preservation without requiring the selected first row itself to contain a specific dirty value. The unit test from Task 1 separately proves literal `N/A`, malformed timestamp text, lowercase currency, and blank text survive Pandas intake unchanged.
+Task 1 unit tests separately prove literal `N/A`, malformed timestamp text, lowercase currency, and blanks survive Pandas intake unchanged.
 
-- [ ] **Step 7: Verify repository hygiene**
-
-Run:
+- [ ] **Step 6: Verify credential hygiene**
 
 ```powershell
 git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
@@ -1436,54 +1272,41 @@ git ls-files | Select-String -Pattern 'application_default_credentials|service-a
 
 Expected: no output.
 
-- [ ] **Step 8: Add the minimum README F04 runbook**
+- [ ] **Step 7: Add README F04 runbook**
 
-Append a section `## Feature 04: Pandas intake + idempotent raw load` documenting only:
+Add `## Feature 04: Pandas intake + idempotent raw load` documenting this command:
 
 ```powershell
-docker compose --profile gcp build gcp-toolbox
-
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.load_raw_batch --batch-date 2025-07-22
 ```
 
-State these invariants in prose:
+State explicitly:
 
-- the transaction batch must resolve to exactly five canonical regional files;
-- same-day FX may be absent and then reports `NO_NEW_RATE`;
-- source checksum metadata is verified before Pandas reads bytes;
-- transaction business fields remain raw strings in F04;
-- rerunning the same immutable logical date must report `tx_inserted_rows=0` and, when FX exists, `fx_inserted_rows=0`;
+- TX requires exactly five canonical regional files.
+- Same-day FX may report `NO_NEW_RATE`.
+- Source checksum metadata is verified before Pandas reads bytes.
+- F04 preserves transaction business fields as raw strings.
+- An unchanged rerun must report `tx_inserted_rows=0` and, when FX exists, `fx_inserted_rows=0`.
 - F04 does not classify DQ failures or resolve effective FX.
 
-Do not add F05/F06/F07 commands or unsupported full-run claims.
-
-- [ ] **Step 9: Run the final F04 gate after README changes**
-
-Run:
+- [ ] **Step 8: Final F04 gate and commit**
 
 ```powershell
 pytest
-
 python -m py_compile `
   pipeline/pandas_intake.py `
   pipeline/raw_load.py `
   pipeline/bigquery_adapter.py `
   scripts/load_raw_batch.py
-
 docker compose config --quiet
 git diff --check
 git status --short
-```
-
-Expected: tests have 0 failures; static checks are clean; status shows only the intended README change before the task commit.
-
-- [ ] **Step 10: Commit Task 4**
-
-```powershell
 git add README.md
 git commit -m "docs: add Feature 04 raw load runbook"
 ```
+
+Expected: tests/static checks are green before the README commit.
 
 ---
 
@@ -1504,8 +1327,8 @@ first FX insert = 2
 second FX insert = 0
 FX partition remains = 2
 
-raw source strings match source bytes for a deterministic sample row
-unit tests prove literal dirty strings survive Pandas intake
+raw_strings_match = True
+unit tests prove dirty strings survive Pandas intake
 pytest = 0 failures
 py_compile = clean
 docker compose config = clean
@@ -1513,4 +1336,4 @@ git diff --check = clean
 credential-file search = empty
 ```
 
-Do not start F05 until this gate is green. F05 owns business-quality classification, accepted/quarantine split, transaction-level duplicate semantics, and reconciliation of raw into classified outputs.
+Do not start F05 until this gate is green. F05 owns business-quality classification, accepted/quarantine split, duplicate business semantics, and raw-to-classified reconciliation.
