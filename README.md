@@ -1,14 +1,14 @@
 # BahtFlow: Airflow, Pandas, BigQuery, and dbt
 
-BahtFlow is a production-minded batch ELT portfolio project for practising the data-engineering workflow used in fintech teams: schedule work with Airflow, validate incoming files with Pandas, load immutable raw data into BigQuery, and transform it into trusted models with dbt.
+BahtFlow is a production-minded batch ELT portfolio project for practising the data-engineering workflow used in fintech teams: schedule work with Airflow, validate incoming files with Pandas, load immutable raw data into BigQuery, and transform it into trusted models. The v1 roadmap keeps business transformation in Pandas; dbt is deferred to a later v2 evolution.
 
 ## Current phase
 
-The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A`. Those records are evidence that later Pandas and dbt stages must classify, quarantine, test, and document data rather than silently discard it.
+The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A` so later stages can classify and quarantine them instead of silently discarding evidence.
 
-Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 adds the first real cloud boundary: a credential-safe local-to-GCS landing path using Application Default Credentials (ADC), service-account impersonation, canonical object paths, and immutable SHA-256 checks. BigQuery, Pandas ingestion, dbt transformation, and real Airflow data-processing tasks remain later features.
+Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently.
 
-Read the [data contract](data/README.md) for the source layout and validation manifest. The fuller architecture is in [the design specification](docs/superpowers/specs/2026-09-01-bahtflow-airflow-pandas-dbt-design.md).
+Read the [data contract](data/README.md) for the source layout and validation manifest. The current v1 roadmap is in [the Pandas v1 design](docs/superpowers/specs/2026-09-02-pandas-v1-roadmap-design.md).
 
 ## Target architecture
 
@@ -16,23 +16,19 @@ Read the [data contract](data/README.md) for the source layout and validation ma
 Daily regional gzip CSVs
           |
           v
-Airflow (local Docker scheduler)
+GCS immutable landing
           |
           v
-Pandas contract checks + load metadata
+Airflow logical-date orchestration
           |
           v
-GCS immutable landing --> BigQuery raw append-only tables
-                                  |
-                                  v
-                         dbt staging / quarantine / marts
+Pandas intake / DQ / FX transformation
+          |
+          v
+BigQuery raw -> accepted/quarantine -> fact/marts
 ```
 
-Starting with a fixed, auditable source lets each subsequent component be developed and tested against the same data contract.
-
 ## Reproduce the source corpus
-
-The committed corpus is generated from the earlier Databricks-edition monthly fixtures. The scripts use only the Python standard library.
 
 ```powershell
 python scripts/split_regional_bootstrap_to_daily.py `
@@ -44,15 +40,13 @@ python scripts/validate_daily_source.py `
   --manifest data\daily_source_manifest.csv
 ```
 
-For local checks, direct pytest to a repository-local temporary directory:
+For local checks:
 
 ```powershell
 python -m pytest tests -v --basetemp .pytest_tmp
 ```
 
 ## Local Docker environment
-
-Feature 00 provides the shared PostgreSQL and toolbox foundation.
 
 ```powershell
 Copy-Item .env.example .env
@@ -65,28 +59,15 @@ docker compose down
 
 `.env` is ignored by Git. Values in `.env.example` are local-development examples only.
 
-## Airflow 3 orchestration skeleton
+## Feature 01: Airflow 3 orchestration skeleton
 
-Feature 01 runs Apache Airflow `3.3.1` with LocalExecutor, the existing PostgreSQL metadata backend, a separate DAG processor, and the API server on `http://localhost:8080`.
-
-The SimpleAuthManager all-admin setting and example API/JWT/Fernet secrets are intentionally local-development settings. Do not reuse them for a shared or production deployment.
-
-Initialize the metadata schema:
+Feature 01 runs Apache Airflow `3.3.1` with LocalExecutor, PostgreSQL metadata, a separate DAG processor, and the API server on `http://localhost:8080`.
 
 ```powershell
 docker compose up airflow-init
-```
-
-Start the Airflow components:
-
-```powershell
 docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
 docker compose ps
-```
 
-Verify the runtime and DAG discovery:
-
-```powershell
 docker compose exec airflow-scheduler airflow version
 docker compose exec airflow-scheduler airflow config get-value core executor
 docker compose exec airflow-scheduler airflow dags list
@@ -95,44 +76,11 @@ docker compose exec airflow-scheduler airflow dags list-import-errors
 
 Expected runtime values are Airflow `3.3.1` and `LocalExecutor`, with `bahtflow_daily` visible and no import errors.
 
-Check the API health endpoint from PowerShell:
-
-```powershell
-Invoke-RestMethod http://localhost:8080/api/v2/monitor/health
-```
-
-Run one isolated logical-date smoke test outside the bounded backfill window:
-
-```powershell
-docker compose exec airflow-scheduler `
-  airflow dags test bahtflow_daily 2025-07-25 --use-executor
-```
-
-Create the Feature 01 three-date backfill:
-
-```powershell
-docker compose exec airflow-scheduler `
-  airflow backfill create `
-    --dag-id bahtflow_daily `
-    --from-date 2025-07-22 `
-    --to-date 2025-07-24 `
-    --max-active-runs 2
-```
-
-Inspect the resulting DAG runs:
-
-```powershell
-docker compose exec airflow-scheduler `
-  airflow dags list-runs bahtflow_daily `
-    --start-date 2025-07-22 `
-    --end-date 2025-07-24
-```
-
-The DAG is intentionally all `EmptyOperator` tasks in Feature 01. It proves orchestration shape, Airflow 3 component wiring, logical-date execution, and explicit backfill only.
+The DAG is intentionally all `EmptyOperator` tasks in Feature 01. It proves orchestration shape and logical-date execution only.
 
 ## Feature 02: GCS landing boundary
 
-Feature 02 keeps Google credentials outside the repository and image. The dedicated `gcp-toolbox` Compose service receives the host ADC file as a read-only bind mount. PostgreSQL and the current EmptyOperator-only Airflow services do not receive GCP credentials.
+Feature 02 keeps Google credentials outside the repository and image. The dedicated `gcp-toolbox` Compose service receives the host ADC file as a read-only bind mount.
 
 The landing layout is:
 
@@ -145,11 +93,9 @@ gs://<BAHTFLOW_GCS_BUCKET>/
     └── fx_manifest.csv
 ```
 
-Every uploaded object stores the exact local file SHA-256 in custom metadata key `bahtflow-source-sha256`. An absent object uploads, an existing object with the same checksum is skipped, and an existing object with a missing or different checksum fails instead of being overwritten. Uploads also use a GCS generation precondition so a race cannot silently replace an object.
+Every uploaded object stores the exact local file SHA-256 in custom metadata key `bahtflow-source-sha256`. An absent object uploads, an existing object with the same checksum is skipped, and a missing/different checksum fails rather than overwriting data.
 
-### 1. Prepare local configuration
-
-Sync the Feature 02 branch, then update the ignored `.env` from `.env.example` and replace the GCP placeholders with real values:
+Required local configuration:
 
 ```text
 BAHTFLOW_GCP_PROJECT=<project-id>
@@ -159,161 +105,144 @@ BAHTFLOW_RUNTIME_SERVICE_ACCOUNT=bahtflow-runtime@<project-id>.iam.gserviceaccou
 GOOGLE_ADC_HOST_PATH=C:/Users/<windows-user>/AppData/Roaming/gcloud/application_default_credentials.json
 ```
 
-Do not commit `.env` or the ADC file. The project must have active Cloud Billing and the Service Usage, IAM Service Account Credentials, and Cloud Storage APIs enabled before the live setup can complete.
-
-### 2. Create the runtime service account and impersonation grant
-
-The developer/admin identity creates infrastructure. The runtime service account performs normal object operations and does not administer bucket IAM or create/delete the bucket.
-
-In PowerShell, set non-secret operator variables for the current shell:
-
-```powershell
-$projectId = "<project-id>"
-$bucketName = "<globally-unique-bucket-name>"
-$developerEmail = "<your-google-account-email>"
-$runtimeSa = "bahtflow-runtime@$projectId.iam.gserviceaccount.com"
-```
-
-Create the runtime service account once if it does not already exist:
-
-```powershell
-gcloud iam service-accounts create bahtflow-runtime `
-  --project=$projectId `
-  --display-name="BahtFlow local runtime"
-```
-
-Allow the developer identity to impersonate it:
-
-```powershell
-gcloud iam service-accounts add-iam-policy-binding $runtimeSa `
-  --project=$projectId `
-  --member="user:$developerEmail" `
-  --role="roles/iam.serviceAccountTokenCreator"
-```
-
-### 3. Bootstrap or verify the bucket with developer ADC
-
-Create normal developer ADC:
-
-```powershell
-gcloud auth application-default login
-```
-
-Build the GCP toolbox and verify the Google Storage client import:
+Create or verify the bucket, grant bucket-scoped object access, and switch ADC to the impersonated runtime identity:
 
 ```powershell
 docker compose --profile gcp build gcp-toolbox
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "from google.cloud import storage; print(storage.__name__)"
-```
 
-Create the bucket if absent, or verify that an existing bucket uses the configured location:
-
-```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.bootstrap_gcs --create-if-missing
-```
 
-For a pre-existing bucket, a non-creating check is available:
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -m scripts.bootstrap_gcs --check-only
-```
-
-After the bucket exists, grant only bucket-scoped object access to the runtime service account:
-
-```powershell
 gcloud storage buckets add-iam-policy-binding gs://$bucketName `
   --member="serviceAccount:$runtimeSa" `
   --role="roles/storage.objectAdmin"
-```
 
-### 4. Replace developer ADC with impersonated runtime ADC
-
-Create an ADC file that the Python client libraries can use to impersonate the runtime service account:
-
-```powershell
 gcloud auth application-default login `
   --impersonate-service-account=$runtimeSa
 ```
 
-Do not print or paste the ADC JSON. The developer identity needs `roles/iam.serviceAccountTokenCreator` on the runtime service account.
-
-Verify credential resolution inside Docker without printing a token:
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "import google.auth; c,p=google.auth.default(); print('project=', p); print('credential_type=', type(c).__name__)"
-```
-
-The ADC metadata may not provide a project ID for impersonated credentials. The application still uses the explicit `BAHTFLOW_GCP_PROJECT` setting when it constructs the GCS client.
-
-### 5. Run the bounded immutable-landing smoke test
-
-The smoke selection contains exactly one transaction file, one FX file, and both manifests:
+Smoke and live verification:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.upload_landing_sources --smoke
-```
 
-On a fresh bucket the first run reports `uploaded=4 skipped=0`. Run the same command again; the required idempotency evidence is `uploaded=0 skipped=4`.
-
-Run the repeatable live verifier. It reads a canonical manifest back from GCS, compares its bytes with the stored SHA-256 metadata, creates one disposable object outside the canonical landing prefixes, proves a changed source checksum is rejected, and deletes the disposable object again:
-
-```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.verify_gcs_live
 ```
 
-Expected non-secret evidence is:
-
-```text
-object=manifests/daily_source_manifest.csv
-readback_checksum_match=True
-conflict_detected=True
-disposable_cleanup=True
-```
-
-The verifier refuses to overwrite or delete `_smoke_conflict/disposable.txt` if that object already exists before the run.
-
-### 6. Optional full-corpus landing
-
-The default uploader processes the complete committed transaction/FX/manifest corpus. Do this only after the bounded smoke test is green:
+The full landing uploader is:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.upload_landing_sources
 ```
 
-This is not required merely to prove Feature 02 wiring; later features can use the full landing set when needed.
+## Feature 03: BigQuery warehouse bootstrap
 
-## Feature 02 development checks
+Feature 03 creates the minimum warehouse boundary needed by later Pandas ingestion. It creates exactly four datasets:
 
-Credential-free logic tests do not require ADC or a live bucket:
-
-```powershell
-python -m pytest tests -v --basetemp .pytest_tmp
-python -m py_compile `
-  pipeline/config.py `
-  pipeline/gcs_landing.py `
-  pipeline/gcs_adapter.py `
-  pipeline/gcs_workflows.py `
-  scripts/bootstrap_gcs.py `
-  scripts/upload_landing_sources.py `
-  scripts/verify_gcs_live.py
-docker compose config --quiet
+```text
+bahtflow_raw
+bahtflow_ops
+bahtflow_analytics
+bahtflow_public
 ```
 
-Repository hygiene checks:
+It creates exactly two raw tables in `bahtflow_raw`:
+
+```text
+transactions  partitioned DAY by batch_date
+fx_rates      partitioned DAY by rate_date
+```
+
+The bootstrap is rerun-safe. Existing resources are verified for dataset location, exact table schema, partition field, and DAY partition type. It never silently replaces a mismatched table.
+
+### 1. Enable BigQuery and grant the runtime identity
+
+```powershell
+gcloud services enable bigquery.googleapis.com `
+  --project=$env:BAHTFLOW_GCP_PROJECT
+
+gcloud projects add-iam-policy-binding $env:BAHTFLOW_GCP_PROJECT `
+  --member="serviceAccount:$env:BAHTFLOW_RUNTIME_SERVICE_ACCOUNT" `
+  --role="roles/bigquery.user"
+
+gcloud projects add-iam-policy-binding $env:BAHTFLOW_GCP_PROJECT `
+  --member="serviceAccount:$env:BAHTFLOW_RUNTIME_SERVICE_ACCOUNT" `
+  --role="roles/bigquery.dataEditor"
+```
+
+The runtime identity remains below BigQuery Admin. Python clients continue to use normal ADC impersonation plus the explicit project ID from `BAHTFLOW_GCP_PROJECT`; no service-account JSON key is stored in the repository or image.
+
+### 2. Build the GCP toolbox
+
+```powershell
+docker compose --profile gcp build gcp-toolbox
+```
+
+### 3. Bootstrap BigQuery twice
+
+First run:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.bootstrap_bigquery
+```
+
+On a fresh project the four datasets and two raw tables report `status=created`.
+
+Run the same command again:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.bootstrap_bigquery
+```
+
+The second run must report `status=verified` for all four datasets and both raw tables. This is the Feature 03 idempotency evidence.
+
+### 4. Run the live verifier
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.verify_bigquery_live
+```
+
+Required Feature 03 evidence:
+
+```text
+datasets=4
+raw_tables=2
+transactions_partition=batch_date
+fx_rates_partition=rate_date
+transactions_rows=0
+fx_rates_rows=0
+```
+
+Feature 04 owns GCS discovery, Pandas reads/validation, source metadata, and idempotent BigQuery raw loading. Feature 03 intentionally stops before ingestion.
+
+## Development checks
+
+```powershell
+pytest
+
+python -m py_compile `
+  pipeline/bigquery_contract.py `
+  pipeline/bigquery_adapter.py `
+  scripts/bootstrap_bigquery.py `
+  scripts/verify_bigquery_live.py
+
+docker compose config --quiet
+git diff --check
+```
+
+Credential hygiene check:
 
 ```powershell
 git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
-git diff main...HEAD --check
 ```
 
-The tracked-file search should not reveal any credential file. Do not grep or print `.env` or ADC contents.
+The tracked-file search must produce no output.
 
 Stop the local environment when finished:
 
