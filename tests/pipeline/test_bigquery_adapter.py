@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
@@ -27,7 +25,8 @@ class FakeClient:
         return self.datasets[full_id]
 
     def create_dataset(self, dataset):
-        self.datasets[dataset.full_dataset_id.replace(":", ".")] = dataset
+        ref = dataset.reference
+        self.datasets[f"{ref.project}.{ref.dataset_id}"] = dataset
         return dataset
 
     def get_table(self, full_id):
@@ -36,7 +35,8 @@ class FakeClient:
         return self.tables[full_id]
 
     def create_table(self, table):
-        self.tables[table.full_table_id.replace(":", ".")] = table
+        ref = table.reference
+        self.tables[f"{ref.project}.{ref.dataset_id}.{ref.table_id}"] = table
         return table
 
     def query(self, sql):
