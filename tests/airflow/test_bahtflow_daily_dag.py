@@ -34,6 +34,14 @@ def test_dag_operational_contract():
         assert text in source
 
 
+def test_dag_stops_at_historical_source_window_end():
+    source = _source()
+    assert (
+        'end_date=pendulum.datetime(2026, 7, 16, tz="Asia/Bangkok")'
+        in source
+    )
+
+
 def test_dag_has_exact_f07_task_ids():
     source = _source()
     for task_id in (
