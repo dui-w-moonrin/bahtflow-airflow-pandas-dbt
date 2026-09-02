@@ -174,6 +174,50 @@ def validate_and_canonicalize_transactions(
     return frame
 
 
+def classify_duplicates(valid_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    accepted_parts: list[pd.DataFrame] = []
+    quarantine_parts: list[pd.DataFrame] = []
+
+    for _txn, group in valid_df.groupby("_txn_canonical", sort=False):
+        ordered = group.sort_values(
+            ["source_file", "source_row_number"],
+            kind="stable",
+        )
+        payloads = set(
+            zip(
+                ordered["_transaction_dt"],
+                ordered["_amount_numeric"],
+                ordered["_currency_canonical"],
+                ordered["region"],
+            )
+        )
+
+        if len(payloads) > 1:
+            rejected = ordered.copy()
+            rejected["_duplicate_reason"] = "DUPLICATE_CONFLICT"
+            quarantine_parts.append(rejected)
+            continue
+
+        accepted_parts.append(ordered.iloc[[0]].copy())
+        if len(ordered) > 1:
+            rejected = ordered.iloc[1:].copy()
+            rejected["_duplicate_reason"] = "DUPLICATE_REPLAY"
+            quarantine_parts.append(rejected)
+
+    accepted = (
+        pd.concat(accepted_parts, ignore_index=False)
+        if accepted_parts
+        else valid_df.iloc[0:0].copy()
+    )
+    if quarantine_parts:
+        duplicate_quarantine = pd.concat(quarantine_parts, ignore_index=False)
+    else:
+        duplicate_quarantine = valid_df.iloc[0:0].copy()
+        duplicate_quarantine["_duplicate_reason"] = pd.Series(dtype="object")
+
+    return accepted, duplicate_quarantine
+
+
 def _project_accepted(valid_df: pd.DataFrame, classified_at: datetime) -> pd.DataFrame:
     if valid_df.empty:
         return pd.DataFrame(columns=list(ACCEPTED_COLUMNS))
@@ -223,44 +267,7 @@ def classify_transactions(
         validated["_base_reason_codes"].map(len).eq(0)
     ].copy()
 
-    accepted_parts: list[pd.DataFrame] = []
-    duplicate_quarantine_parts: list[pd.DataFrame] = []
-    duplicate_reason_parts: list[list[list[str]]] = []
-
-    for _txn, group in valid.groupby("_txn_canonical", sort=False):
-        ordered = group.sort_values(
-            ["source_file", "source_row_number"],
-            kind="stable",
-        )
-        payloads = set(
-            zip(
-                ordered["_transaction_dt"],
-                ordered["_amount_numeric"],
-                ordered["_currency_canonical"],
-                ordered["region"],
-            )
-        )
-
-        if len(payloads) > 1:
-            duplicate_quarantine_parts.append(ordered)
-            duplicate_reason_parts.append(
-                [["DUPLICATE_CONFLICT"] for _ in range(len(ordered))]
-            )
-            continue
-
-        accepted_parts.append(ordered.iloc[[0]])
-        if len(ordered) > 1:
-            replay = ordered.iloc[1:]
-            duplicate_quarantine_parts.append(replay)
-            duplicate_reason_parts.append(
-                [["DUPLICATE_REPLAY"] for _ in range(len(replay))]
-            )
-
-    accepted_source = (
-        pd.concat(accepted_parts, ignore_index=False)
-        if accepted_parts
-        else valid.iloc[0:0].copy()
-    )
+    accepted_source, duplicate_quarantine = classify_duplicates(valid)
 
     quarantine_parts: list[pd.DataFrame] = []
     if not base_invalid.empty:
@@ -272,14 +279,13 @@ def classify_transactions(
             )
         )
 
-    for duplicate_frame, reason_codes in zip(
-        duplicate_quarantine_parts,
-        duplicate_reason_parts,
-    ):
+    if not duplicate_quarantine.empty:
         quarantine_parts.append(
             _project_quarantine(
-                duplicate_frame,
-                reason_codes,
+                duplicate_quarantine,
+                duplicate_quarantine["_duplicate_reason"].map(
+                    lambda reason: [reason]
+                ).tolist(),
                 classified_at,
             )
         )
