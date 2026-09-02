@@ -107,6 +107,29 @@ class BigQueryAdapter:
         ).result()
         return {str(row[0]) for row in rows}
 
+    def query_partition_rows(
+        self,
+        dataset_id: str,
+        table_id: str,
+        partition_field: str,
+        partition_date: date,
+        columns: tuple[str, ...],
+    ) -> list[dict]:
+        if not columns:
+            raise ValueError("columns must not be empty")
+
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        select_list = ", ".join(columns)
+        sql = (
+            f"SELECT {select_list} FROM `{full_id}` "
+            f"WHERE {partition_field} = @partition_date"
+        )
+        rows = self._client.query(
+            sql,
+            job_config=self._partition_job_config(partition_date),
+        ).result()
+        return [dict(row.items()) for row in rows]
+
     def append_rows(
         self,
         dataset_id: str,
