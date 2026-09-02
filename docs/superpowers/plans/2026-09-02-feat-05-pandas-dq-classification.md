@@ -63,16 +63,7 @@ No generic repository or service framework is introduced.
 
 **Interfaces:**
 - Consumes: `BigQueryAdapter.ensure_partitioned_table(dataset_id, table_id, schema, partition_field) -> str` and `load_gcp_settings()`.
-- Produces:
-  - `ACCEPTED_DATASET_ID: str`
-  - `ACCEPTED_TABLE_ID: str`
-  - `ACCEPTED_TRANSACTIONS_SCHEMA: tuple[bigquery.SchemaField, ...]`
-  - `ACCEPTED_TRANSACTIONS_PARTITION_FIELD: str`
-  - `QUARANTINE_DATASET_ID: str`
-  - `QUARANTINE_TABLE_ID: str`
-  - `QUARANTINE_TRANSACTIONS_SCHEMA: tuple[bigquery.SchemaField, ...]`
-  - `QUARANTINE_TRANSACTIONS_PARTITION_FIELD: str`
-  - `bootstrap_classification(adapter) -> list[tuple[str, str]]`
+- Produces: F05 table constants/schemas and `bootstrap_classification(adapter) -> list[tuple[str, str]]`.
 
 - [ ] **Step 1: Write failing exact-schema tests**
 
@@ -130,13 +121,11 @@ def test_quarantine_transactions_contract_is_exact():
 
 - [ ] **Step 2: Run the contract tests and observe RED**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py -v
 ```
 
-Expected: collection/import failure because the F05 contract names do not exist.
+Expected: import failure because the F05 contract names do not exist.
 
 - [ ] **Step 3: Add the exact F05 constants and schemas**
 
@@ -183,8 +172,6 @@ QUARANTINE_TRANSACTIONS_PARTITION_FIELD = "batch_date"
 
 - [ ] **Step 4: Re-run contract tests and observe GREEN**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py -v
 ```
@@ -210,7 +197,6 @@ class RecordingAdapter:
 
 def test_bootstrap_classification_targets_exactly_two_f05_tables():
     adapter = RecordingAdapter()
-
     statuses = bootstrap_classification(adapter)
 
     assert [name for name, _ in statuses] == [
@@ -228,8 +214,6 @@ def test_bootstrap_classification_targets_exactly_two_f05_tables():
 ```
 
 - [ ] **Step 6: Run the bootstrap test and observe RED**
-
-Run:
 
 ```powershell
 pytest tests/scripts/test_bootstrap_classification.py -v
@@ -296,8 +280,6 @@ if __name__ == "__main__":
 
 - [ ] **Step 8: Run Task 1 tests and observe GREEN**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py tests/scripts/test_bootstrap_classification.py -v
 ```
@@ -320,10 +302,7 @@ git commit -m "feat: add classification table contracts"
 - Create: `tests/pipeline/test_transaction_classification.py`
 
 **Interfaces:**
-- Consumes raw transaction columns `txn`, `dtts`, `amount`, `currency`, `region`, `source_file`, `source_checksum`, `source_row_number`, `source_row_id`, `batch_date`, `ingested_at`.
-- Produces `validate_and_canonicalize_transactions(raw_df: pd.DataFrame, batch_date: date) -> pd.DataFrame`.
-- Returned frame retains all raw columns and adds `_txn_canonical`, `_transaction_dt`, `_amount_numeric`, `_currency_canonical`, `_base_reason_codes`.
-- Produces `TransactionClassificationError`, `RAW_TRANSACTION_COLUMNS`, `BASE_REASON_ORDER`, `VALID_CURRENCIES`, `VALID_REGIONS`.
+- Produces `validate_and_canonicalize_transactions(raw_df: pd.DataFrame, batch_date: date) -> pd.DataFrame` plus `TransactionClassificationError`, `RAW_TRANSACTION_COLUMNS`, `BASE_REASON_ORDER`, `VALID_CURRENCIES`, and `VALID_REGIONS`.
 
 - [ ] **Step 1: Write the first failing canonicalization test**
 
@@ -361,7 +340,6 @@ def test_base_validation_canonicalizes_valid_values():
         pd.DataFrame([raw_row()]),
         date(2025, 7, 22),
     )
-
     row = result.iloc[0]
     assert row["_txn_canonical"] == "TX-1"
     assert row["_transaction_dt"] == pd.Timestamp("2025-07-22 09:30:00")
@@ -371,8 +349,6 @@ def test_base_validation_canonicalizes_valid_values():
 ```
 
 - [ ] **Step 2: Run the test and observe RED**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py::test_base_validation_canonicalizes_valid_values -v
@@ -393,17 +369,9 @@ from decimal import Decimal, InvalidOperation
 import pandas as pd
 
 RAW_TRANSACTION_COLUMNS = (
-    "txn",
-    "dtts",
-    "amount",
-    "currency",
-    "region",
-    "source_file",
-    "source_checksum",
-    "source_row_number",
-    "source_row_id",
-    "batch_date",
-    "ingested_at",
+    "txn", "dtts", "amount", "currency", "region",
+    "source_file", "source_checksum", "source_row_number",
+    "source_row_id", "batch_date", "ingested_at",
 )
 BASE_REASON_ORDER = (
     "MISSING_TXN",
@@ -442,7 +410,6 @@ def _parse_bigquery_numeric(value) -> Decimal | None:
         return None
     if not parsed.is_finite():
         return None
-
     _sign, digits, exponent = parsed.as_tuple()
     if exponent >= 0:
         scale = 0
@@ -469,7 +436,6 @@ def validate_and_canonicalize_transactions(
 ) -> pd.DataFrame:
     _require_raw_columns(raw_df)
     frame = raw_df.loc[:, list(RAW_TRANSACTION_COLUMNS)].copy()
-
     txn_text = frame["txn"].map(
         lambda value: "" if _is_missing(value) else str(value).strip()
     )
@@ -492,27 +458,19 @@ def validate_and_canonicalize_transactions(
     frame["_amount_numeric"] = amount_text.map(_parse_bigquery_numeric)
     frame["_currency_canonical"] = currency_text
 
-    missing_txn = txn_text.eq("")
-    invalid_dtts = frame["_transaction_dt"].isna()
-    dtts_batch_mismatch = (
-        frame["_transaction_dt"].notna()
-        & frame["_transaction_dt"].dt.date.ne(batch_date)
-    )
-    invalid_amount = frame["_amount_numeric"].isna()
-    negative_amount = frame["_amount_numeric"].map(
-        lambda value: value is not None and value < Decimal("0")
-    )
-    invalid_currency = ~currency_text.isin(VALID_CURRENCIES)
-    invalid_region = ~frame["region"].isin(VALID_REGIONS)
-
     masks = {
-        "MISSING_TXN": missing_txn,
-        "INVALID_DTTS": invalid_dtts,
-        "DTTS_BATCH_DATE_MISMATCH": dtts_batch_mismatch,
-        "INVALID_AMOUNT": invalid_amount,
-        "NEGATIVE_AMOUNT": negative_amount,
-        "INVALID_CURRENCY": invalid_currency,
-        "INVALID_REGION": invalid_region,
+        "MISSING_TXN": txn_text.eq(""),
+        "INVALID_DTTS": frame["_transaction_dt"].isna(),
+        "DTTS_BATCH_DATE_MISMATCH": (
+            frame["_transaction_dt"].notna()
+            & frame["_transaction_dt"].dt.date.ne(batch_date)
+        ),
+        "INVALID_AMOUNT": frame["_amount_numeric"].isna(),
+        "NEGATIVE_AMOUNT": frame["_amount_numeric"].map(
+            lambda value: value is not None and value < Decimal("0")
+        ),
+        "INVALID_CURRENCY": ~currency_text.isin(VALID_CURRENCIES),
+        "INVALID_REGION": ~frame["region"].isin(VALID_REGIONS),
     }
     frame["_base_reason_codes"] = [
         [reason for reason in BASE_REASON_ORDER if bool(masks[reason].loc[index])]
@@ -523,17 +481,15 @@ def validate_and_canonicalize_transactions(
 
 - [ ] **Step 4: Re-run the first test and observe GREEN**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py::test_base_validation_canonicalizes_valid_values -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 5: Add failing tests for every base-validation rule and reason order**
+- [ ] **Step 5: Add failing tests for all base rules and deterministic reason order**
 
-Append concrete cases:
+Append to the same test file:
 
 ```python
 import pytest
@@ -541,7 +497,7 @@ import pytest
 from pipeline.transaction_classification import TransactionClassificationError
 
 
-def test_zero_amount_is_valid_and_negative_amount_is_quarantinable():
+def test_zero_amount_is_valid_and_negative_amount_is_flagged():
     result = validate_and_canonicalize_transactions(
         pd.DataFrame([
             raw_row(source_row_id="zero", amount="0"),
@@ -587,6 +543,21 @@ def test_datetime_rules_distinguish_parse_failure_from_batch_mismatch():
     ]
 
 
+def test_currency_and_region_rules_canonicalize_or_reject_explicitly():
+    result = validate_and_canonicalize_transactions(
+        pd.DataFrame([
+            raw_row(source_row_id="eur", currency=" eur ", region="north"),
+            raw_row(source_row_id="gbp", currency="GBP", region="north"),
+            raw_row(source_row_id="bad-region", currency="THB", region="unknown"),
+        ]),
+        date(2025, 7, 22),
+    ).set_index("source_row_id")
+    assert result.loc["eur", "_currency_canonical"] == "EUR"
+    assert result.loc["eur", "_base_reason_codes"] == []
+    assert result.loc["gbp", "_base_reason_codes"] == ["INVALID_CURRENCY"]
+    assert result.loc["bad-region", "_base_reason_codes"] == ["INVALID_REGION"]
+
+
 def test_multiple_base_failures_keep_fixed_reason_order():
     result = validate_and_canonicalize_transactions(
         pd.DataFrame([
@@ -608,11 +579,7 @@ def test_missing_required_raw_column_fails_explicitly():
         validate_and_canonicalize_transactions(frame, date(2025, 7, 22))
 ```
 
-Also add one test that `" eur "` canonicalizes to `EUR` while `GBP` gets `INVALID_CURRENCY`, and one test that an unsupported region gets `INVALID_REGION`.
-
 - [ ] **Step 6: Run all Task 2 tests and make them GREEN**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py -v
@@ -636,15 +603,12 @@ git commit -m "feat: validate and canonicalize transactions"
 - Modify: `tests/pipeline/test_transaction_classification.py`
 
 **Interfaces:**
-- Consumes: `validate_and_canonicalize_transactions(raw_df, batch_date) -> pd.DataFrame` from Task 2.
-- Produces:
-  - `ClassificationResult(accepted: pd.DataFrame, quarantine: pd.DataFrame)`
-  - `classify_duplicates(valid_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]`
-  - `classify_transactions(raw_df: pd.DataFrame, batch_date: date, classified_at: datetime) -> ClassificationResult`
+- Consumes: Task 2 validated frame.
+- Produces `ClassificationResult`, `classify_duplicates(valid_df)`, and `classify_transactions(raw_df, batch_date, classified_at)`.
 
 - [ ] **Step 1: Write the failing exact-replay test**
 
-Append to `tests/pipeline/test_transaction_classification.py`:
+Append:
 
 ```python
 from pipeline.transaction_classification import classify_transactions
@@ -676,7 +640,6 @@ def test_exact_replay_accepts_lowest_source_lineage():
         date(2025, 7, 22),
         datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
     )
-
     assert result.accepted["source_row_id"].tolist() == ["winner"]
     quarantine = result.quarantine.sort_values("source_row_id").reset_index(drop=True)
     assert quarantine["source_row_id"].tolist() == ["bkk-later", "north"]
@@ -688,15 +651,13 @@ def test_exact_replay_accepts_lowest_source_lineage():
 
 - [ ] **Step 2: Run the replay test and observe RED**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py::test_exact_replay_accepts_lowest_source_lineage -v
 ```
 
 Expected: import failure because `classify_transactions` does not exist.
 
-- [ ] **Step 3: Implement result types, duplicate rules, and output projections**
+- [ ] **Step 3: Implement duplicate classification and exact output projections**
 
 Extend `pipeline/transaction_classification.py`:
 
@@ -705,33 +666,14 @@ from dataclasses import dataclass
 from datetime import datetime
 
 ACCEPTED_COLUMNS = (
-    "txn",
-    "transaction_dt",
-    "amount",
-    "currency",
-    "region",
-    "source_file",
-    "source_checksum",
-    "source_row_number",
-    "source_row_id",
-    "batch_date",
-    "ingested_at",
-    "classified_at",
+    "txn", "transaction_dt", "amount", "currency", "region",
+    "source_file", "source_checksum", "source_row_number", "source_row_id",
+    "batch_date", "ingested_at", "classified_at",
 )
 QUARANTINE_COLUMNS = (
-    "txn",
-    "dtts",
-    "amount",
-    "currency",
-    "region",
-    "source_file",
-    "source_checksum",
-    "source_row_number",
-    "source_row_id",
-    "batch_date",
-    "ingested_at",
-    "reason_codes",
-    "quarantined_at",
+    "txn", "dtts", "amount", "currency", "region",
+    "source_file", "source_checksum", "source_row_number", "source_row_id",
+    "batch_date", "ingested_at", "reason_codes", "quarantined_at",
 )
 
 
@@ -750,7 +692,6 @@ def classify_duplicates(valid_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         "_currency_canonical",
         "region",
     ]
-
     for _txn, group in valid_df.groupby("_txn_canonical", sort=False, dropna=False):
         payloads = set(
             group.loc[:, payload_columns].itertuples(index=False, name=None)
@@ -763,25 +704,23 @@ def classify_duplicates(valid_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
             rejected = ordered.copy()
             rejected["_duplicate_reason"] = "DUPLICATE_CONFLICT"
             quarantine_parts.append(rejected)
-            continue
+        else:
+            accepted_parts.append(ordered.iloc[[0]].copy())
+            if len(ordered) > 1:
+                rejected = ordered.iloc[1:].copy()
+                rejected["_duplicate_reason"] = "DUPLICATE_REPLAY"
+                quarantine_parts.append(rejected)
 
-        accepted_parts.append(ordered.iloc[[0]].copy())
-        if len(ordered) > 1:
-            rejected = ordered.iloc[1:].copy()
-            rejected["_duplicate_reason"] = "DUPLICATE_REPLAY"
-            quarantine_parts.append(rejected)
-
-    if accepted_parts:
-        accepted = pd.concat(accepted_parts, ignore_index=True)
-    else:
-        accepted = valid_df.iloc[0:0].copy()
-
+    accepted = (
+        pd.concat(accepted_parts, ignore_index=True)
+        if accepted_parts
+        else valid_df.iloc[0:0].copy()
+    )
     if quarantine_parts:
         duplicate_quarantine = pd.concat(quarantine_parts, ignore_index=True)
     else:
         duplicate_quarantine = valid_df.iloc[0:0].copy()
         duplicate_quarantine["_duplicate_reason"] = pd.Series(dtype="object")
-
     return accepted, duplicate_quarantine
 
 
@@ -794,7 +733,6 @@ def classify_transactions(
     base_invalid_mask = validated["_base_reason_codes"].map(bool)
     base_invalid = validated.loc[base_invalid_mask].copy()
     base_valid = validated.loc[~base_invalid_mask].copy()
-
     accepted_valid, duplicate_quarantine = classify_duplicates(base_valid)
 
     accepted = pd.DataFrame(index=accepted_valid.index)
@@ -804,12 +742,8 @@ def classify_transactions(
     accepted["currency"] = accepted_valid["_currency_canonical"]
     accepted["region"] = accepted_valid["region"]
     for column in (
-        "source_file",
-        "source_checksum",
-        "source_row_number",
-        "source_row_id",
-        "batch_date",
-        "ingested_at",
+        "source_file", "source_checksum", "source_row_number",
+        "source_row_id", "batch_date", "ingested_at",
     ):
         accepted[column] = accepted_valid[column]
     accepted["classified_at"] = classified_at
@@ -825,10 +759,7 @@ def classify_transactions(
     )
     duplicate_output["quarantined_at"] = classified_at
 
-    quarantine = pd.concat(
-        [base_quarantine, duplicate_output],
-        ignore_index=True,
-    )
+    quarantine = pd.concat([base_quarantine, duplicate_output], ignore_index=True)
     quarantine = quarantine.loc[:, list(QUARANTINE_COLUMNS)]
 
     if len(raw_df) != len(accepted) + len(quarantine):
@@ -836,13 +767,10 @@ def classify_transactions(
             "Classification reconciliation failed: "
             f"raw={len(raw_df)} accepted={len(accepted)} quarantine={len(quarantine)}"
         )
-
     return ClassificationResult(accepted=accepted, quarantine=quarantine)
 ```
 
 - [ ] **Step 4: Re-run the replay test and observe GREEN**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py::test_exact_replay_accepts_lowest_source_lineage -v
@@ -850,7 +778,7 @@ pytest tests/pipeline/test_transaction_classification.py::test_exact_replay_acce
 
 Expected: PASS.
 
-- [ ] **Step 5: Add failing conflict, base-invalid isolation, raw-preservation, and reconciliation tests**
+- [ ] **Step 5: Add failing conflict, invalid-isolation, raw-preservation, and reconciliation tests**
 
 Append:
 
@@ -861,15 +789,12 @@ def test_conflicting_canonical_payloads_quarantine_every_valid_occurrence():
         raw_row(source_row_id="b", txn="TX-C", amount="101.00"),
     ])
     result = classify_transactions(
-        frame,
-        date(2025, 7, 22),
-        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        frame, date(2025, 7, 22), datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
     )
     assert result.accepted.empty
     assert set(result.quarantine["source_row_id"]) == {"a", "b"}
     assert result.quarantine["reason_codes"].tolist() == [
-        ["DUPLICATE_CONFLICT"],
-        ["DUPLICATE_CONFLICT"],
+        ["DUPLICATE_CONFLICT"], ["DUPLICATE_CONFLICT"]
     ]
 
 
@@ -879,9 +804,7 @@ def test_base_invalid_row_does_not_poison_valid_row_with_same_txn():
         raw_row(source_row_id="invalid", txn="TX-X", amount="N/A"),
     ])
     result = classify_transactions(
-        frame,
-        date(2025, 7, 22),
-        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        frame, date(2025, 7, 22), datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
     )
     assert result.accepted["source_row_id"].tolist() == ["valid"]
     invalid = result.quarantine.set_index("source_row_id").loc["invalid"]
@@ -894,17 +817,13 @@ def test_accepted_is_canonical_and_quarantine_preserves_raw_business_values():
         raw_row(source_row_id="bad", txn=" raw-value ", amount="N/A", currency=" gbp "),
     ])
     result = classify_transactions(
-        frame,
-        date(2025, 7, 22),
-        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        frame, date(2025, 7, 22), datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
     )
-
     accepted = result.accepted.iloc[0]
     assert accepted["txn"] == "TX-OK"
     assert accepted["amount"] == Decimal("100.50")
     assert accepted["currency"] == "USD"
     assert isinstance(accepted["transaction_dt"], pd.Timestamp)
-
     quarantined = result.quarantine.iloc[0]
     assert quarantined["txn"] == " raw-value "
     assert quarantined["amount"] == "N/A"
@@ -920,9 +839,7 @@ def test_every_raw_row_has_exactly_one_classification_outcome():
         raw_row(source_row_id="invalid", txn="TX-I", amount="N/A"),
     ])
     result = classify_transactions(
-        frame,
-        date(2025, 7, 22),
-        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        frame, date(2025, 7, 22), datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
     )
     output_ids = set(result.accepted["source_row_id"]) | set(
         result.quarantine["source_row_id"]
@@ -931,9 +848,7 @@ def test_every_raw_row_has_exactly_one_classification_outcome():
     assert output_ids == set(frame["source_row_id"])
 ```
 
-- [ ] **Step 6: Run the full pure-Pandas suite and make it GREEN**
-
-Run:
+- [ ] **Step 6: Run the full classifier suite and make it GREEN**
 
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py -v
@@ -957,14 +872,22 @@ git commit -m "feat: classify transaction data quality"
 - Modify: `tests/pipeline/test_bigquery_adapter.py`
 
 **Interfaces:**
-- Consumes: existing `_partition_job_config(partition_date)`.
-- Produces `BigQueryAdapter.query_partition_rows(dataset_id: str, table_id: str, partition_field: str, partition_date: date, columns: tuple[str, ...]) -> list[dict]`.
+- Consumes existing `_partition_job_config(partition_date)`.
+- Produces `BigQueryAdapter.query_partition_rows(dataset_id, table_id, partition_field, partition_date, columns) -> list[dict]`.
 
-- [ ] **Step 1: Write the failing adapter test**
+- [ ] **Step 1: Write the failing adapter test including the mapping-row fake**
 
-Extend `tests/pipeline/test_bigquery_adapter.py` with a fake row supporting `.items()` and configure the existing fake client query result. Test:
+Append to `tests/pipeline/test_bigquery_adapter.py`:
 
 ```python
+class FakeMappingRow:
+    def __init__(self, values):
+        self._values = values
+
+    def items(self):
+        return self._values.items()
+
+
 def test_query_partition_rows_selects_requested_columns_and_returns_dicts():
     client = FakeClient()
     client.query_rows = [
@@ -972,15 +895,10 @@ def test_query_partition_rows_selects_requested_columns_and_returns_dicts():
         FakeMappingRow({"txn": "TX-2", "source_row_id": "row-2"}),
     ]
     adapter = BigQueryAdapter("proj", client=client)
-
     rows = adapter.query_partition_rows(
-        "bahtflow_raw",
-        "transactions",
-        "batch_date",
-        date(2025, 7, 22),
+        "bahtflow_raw", "transactions", "batch_date", date(2025, 7, 22),
         ("txn", "source_row_id"),
     )
-
     assert rows == [
         {"txn": "TX-1", "source_row_id": "row-1"},
         {"txn": "TX-2", "source_row_id": "row-2"},
@@ -993,8 +911,6 @@ def test_query_partition_rows_selects_requested_columns_and_returns_dicts():
 ```
 
 - [ ] **Step 2: Run the adapter test and observe RED**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py::test_query_partition_rows_selects_requested_columns_and_returns_dicts -v
@@ -1032,8 +948,6 @@ def query_partition_rows(
 
 - [ ] **Step 4: Run adapter and contract tests and observe GREEN**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py tests/pipeline/test_bigquery_contract.py -v
 ```
@@ -1049,17 +963,17 @@ git commit -m "feat: read partition rows from bigquery"
 
 ---
 
-### Task 5: One-Batch Classification Persistence and Partial-Retry Recovery
+### Task 5: One-Batch Persistence and Partial-Retry Recovery
 
 **Files:**
 - Create: `pipeline/classification_load.py`
 - Create: `tests/pipeline/test_classification_load.py`
 
 **Interfaces:**
-- Consumes: `query_partition_rows`, `query_source_row_ids`, `append_rows`, `query_partition_row_count`, `anti_filter_existing`, and `classify_transactions`.
-- Produces `ClassificationLoadError`, `ClassificationLoadSummary`, and `classify_and_load_batch(batch_date: date, bigquery_adapter, classified_at: datetime | None = None) -> ClassificationLoadSummary`.
+- Consumes Task 3 classifier, Task 4 partition reader, existing `query_source_row_ids`, `append_rows`, `query_partition_row_count`, and `anti_filter_existing`.
+- Produces `ClassificationLoadError`, `ClassificationLoadSummary`, and `classify_and_load_batch`.
 
-- [ ] **Step 1: Write the concrete stateful fake and first-run/rerun test**
+- [ ] **Step 1: Write the stateful fake, concrete fixture, and failing first-run/rerun test**
 
 Create `tests/pipeline/test_classification_load.py`:
 
@@ -1078,44 +992,16 @@ def row_matches_date(row, partition_date):
 @pytest.fixture
 def raw_rows_fixture():
     common = {
-        "dtts": "2025-07-22 09:30:00",
-        "amount": "100.00",
-        "currency": "THB",
-        "region": "bkk",
-        "source_checksum": "abc",
+        "dtts": "2025-07-22 09:30:00", "amount": "100.00",
+        "currency": "THB", "region": "bkk", "source_checksum": "abc",
         "batch_date": date(2025, 7, 22),
         "ingested_at": datetime(2026, 9, 2, tzinfo=timezone.utc),
     }
     return [
-        {
-            **common,
-            "txn": "TX-U",
-            "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz",
-            "source_row_number": 1,
-            "source_row_id": "unique",
-        },
-        {
-            **common,
-            "txn": "TX-R",
-            "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz",
-            "source_row_number": 2,
-            "source_row_id": "replay-winner",
-        },
-        {
-            **common,
-            "txn": "TX-R",
-            "source_file": "transactions/business_date=2025-07-22/sales_north_20250722.csv.gz",
-            "source_row_number": 1,
-            "source_row_id": "replay-loser",
-        },
-        {
-            **common,
-            "txn": "TX-I",
-            "amount": "N/A",
-            "source_file": "transactions/business_date=2025-07-22/sales_south_20250722.csv.gz",
-            "source_row_number": 1,
-            "source_row_id": "invalid",
-        },
+        {**common, "txn": "TX-U", "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz", "source_row_number": 1, "source_row_id": "unique"},
+        {**common, "txn": "TX-R", "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz", "source_row_number": 2, "source_row_id": "replay-winner"},
+        {**common, "txn": "TX-R", "source_file": "transactions/business_date=2025-07-22/sales_north_20250722.csv.gz", "source_row_number": 1, "source_row_id": "replay-loser"},
+        {**common, "txn": "TX-I", "amount": "N/A", "source_file": "transactions/business_date=2025-07-22/sales_south_20250722.csv.gz", "source_row_number": 1, "source_row_id": "invalid"},
     ]
 
 
@@ -1128,61 +1014,31 @@ class StatefulBigQueryFake:
         }
         self.fail_next_quarantine_append = False
 
-    def query_partition_rows(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
-        columns,
-    ):
-        assert (dataset_id, table_id, partition_field) == (
-            "bahtflow_raw",
-            "transactions",
-            "batch_date",
-        )
+    def query_partition_rows(self, dataset_id, table_id, partition_field, partition_date, columns):
+        assert (dataset_id, table_id, partition_field) == ("bahtflow_raw", "transactions", "batch_date")
         return [
             {column: row[column] for column in columns}
-            for row in self.raw_rows
-            if row_matches_date(row, partition_date)
+            for row in self.raw_rows if row_matches_date(row, partition_date)
         ]
 
-    def query_source_row_ids(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
-    ):
+    def query_source_row_ids(self, dataset_id, table_id, partition_field, partition_date):
         assert partition_field == "batch_date"
         return {
-            row["source_row_id"]
-            for row in self.outputs[(dataset_id, table_id)]
+            row["source_row_id"] for row in self.outputs[(dataset_id, table_id)]
             if row_matches_date(row, partition_date)
         }
 
     def append_rows(self, dataset_id, table_id, rows, schema):
-        if (
-            self.fail_next_quarantine_append
-            and (dataset_id, table_id)
-            == ("bahtflow_ops", "transactions_quarantine")
-        ):
+        if self.fail_next_quarantine_append and (dataset_id, table_id) == ("bahtflow_ops", "transactions_quarantine"):
             self.fail_next_quarantine_append = False
             raise RuntimeError("simulated quarantine write failure")
         self.outputs[(dataset_id, table_id)].extend(rows)
         return len(rows)
 
-    def query_partition_row_count(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
-    ):
+    def query_partition_row_count(self, dataset_id, table_id, partition_field, partition_date):
         assert partition_field == "batch_date"
         return sum(
-            1
-            for row in self.outputs[(dataset_id, table_id)]
+            1 for row in self.outputs[(dataset_id, table_id)]
             if row_matches_date(row, partition_date)
         )
 
@@ -1190,44 +1046,26 @@ class StatefulBigQueryFake:
 def test_first_run_classifies_and_rerun_inserts_zero(raw_rows_fixture):
     fake = StatefulBigQueryFake(raw_rows_fixture)
     when = datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc)
-
-    first = classify_and_load_batch(
-        batch_date=date(2025, 7, 22),
-        bigquery_adapter=fake,
-        classified_at=when,
-    )
-    second = classify_and_load_batch(
-        batch_date=date(2025, 7, 22),
-        bigquery_adapter=fake,
-        classified_at=when,
-    )
-
-    assert first.raw_rows == 4
-    assert first.accepted_rows == 2
-    assert first.quarantine_rows == 2
-    assert first.accepted_inserted_rows == 2
-    assert first.quarantine_inserted_rows == 2
-    assert first.accepted_partition_rows == 2
-    assert first.quarantine_partition_rows == 2
+    first = classify_and_load_batch(batch_date=date(2025, 7, 22), bigquery_adapter=fake, classified_at=when)
+    second = classify_and_load_batch(batch_date=date(2025, 7, 22), bigquery_adapter=fake, classified_at=when)
+    assert (first.raw_rows, first.accepted_rows, first.quarantine_rows) == (4, 2, 2)
+    assert (first.accepted_inserted_rows, first.quarantine_inserted_rows) == (2, 2)
+    assert (first.accepted_partition_rows, first.quarantine_partition_rows) == (2, 2)
     assert first.reconciled is True
-    assert second.accepted_inserted_rows == 0
-    assert second.quarantine_inserted_rows == 0
-    assert second.accepted_partition_rows == 2
-    assert second.quarantine_partition_rows == 2
+    assert (second.accepted_inserted_rows, second.quarantine_inserted_rows) == (0, 0)
+    assert (second.accepted_partition_rows, second.quarantine_partition_rows) == (2, 2)
     assert second.reconciled is True
 ```
 
-- [ ] **Step 2: Run the orchestration test and observe RED**
-
-Run:
+- [ ] **Step 2: Run the first-run/rerun test and observe RED**
 
 ```powershell
 pytest tests/pipeline/test_classification_load.py::test_first_run_classifies_and_rerun_inserts_zero -v
 ```
 
-Expected: module import failure because `pipeline.classification_load` does not exist.
+Expected: module import failure for `pipeline.classification_load`.
 
-- [ ] **Step 3: Implement JSON-safe records and one-batch orchestration**
+- [ ] **Step 3: Implement JSON-safe serialization and one-batch orchestration**
 
 Create `pipeline/classification_load.py`:
 
@@ -1241,21 +1079,14 @@ from decimal import Decimal
 import pandas as pd
 
 from pipeline.bigquery_contract import (
-    ACCEPTED_DATASET_ID,
-    ACCEPTED_TABLE_ID,
-    ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
-    ACCEPTED_TRANSACTIONS_SCHEMA,
-    QUARANTINE_DATASET_ID,
-    QUARANTINE_TABLE_ID,
-    QUARANTINE_TRANSACTIONS_PARTITION_FIELD,
-    QUARANTINE_TRANSACTIONS_SCHEMA,
+    ACCEPTED_DATASET_ID, ACCEPTED_TABLE_ID,
+    ACCEPTED_TRANSACTIONS_PARTITION_FIELD, ACCEPTED_TRANSACTIONS_SCHEMA,
+    QUARANTINE_DATASET_ID, QUARANTINE_TABLE_ID,
+    QUARANTINE_TRANSACTIONS_PARTITION_FIELD, QUARANTINE_TRANSACTIONS_SCHEMA,
     TRANSACTIONS_PARTITION_FIELD,
 )
 from pipeline.pandas_intake import anti_filter_existing
-from pipeline.transaction_classification import (
-    RAW_TRANSACTION_COLUMNS,
-    classify_transactions,
-)
+from pipeline.transaction_classification import RAW_TRANSACTION_COLUMNS, classify_transactions
 
 
 class ClassificationLoadError(RuntimeError):
@@ -1299,81 +1130,54 @@ def _frame_to_records(frame: pd.DataFrame) -> list[dict]:
     ]
 
 
-def classify_and_load_batch(
-    *,
-    batch_date: date,
-    bigquery_adapter,
-    classified_at: datetime | None = None,
-) -> ClassificationLoadSummary:
+def classify_and_load_batch(*, batch_date: date, bigquery_adapter, classified_at: datetime | None = None) -> ClassificationLoadSummary:
     invocation_time = classified_at or datetime.now(timezone.utc)
     raw_rows = bigquery_adapter.query_partition_rows(
-        "bahtflow_raw",
-        "transactions",
-        TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
-        RAW_TRANSACTION_COLUMNS,
+        "bahtflow_raw", "transactions", TRANSACTIONS_PARTITION_FIELD,
+        batch_date, RAW_TRANSACTION_COLUMNS,
     )
     raw_frame = pd.DataFrame(raw_rows, columns=list(RAW_TRANSACTION_COLUMNS))
     result = classify_transactions(raw_frame, batch_date, invocation_time)
-
     if len(raw_frame) != len(result.accepted) + len(result.quarantine):
         raise ClassificationLoadError("In-memory classification reconciliation failed")
 
     accepted_existing = bigquery_adapter.query_source_row_ids(
-        ACCEPTED_DATASET_ID,
-        ACCEPTED_TABLE_ID,
-        ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        ACCEPTED_DATASET_ID, ACCEPTED_TABLE_ID,
+        ACCEPTED_TRANSACTIONS_PARTITION_FIELD, batch_date,
     )
     accepted_new = anti_filter_existing(result.accepted, accepted_existing)
     accepted_inserted = bigquery_adapter.append_rows(
-        ACCEPTED_DATASET_ID,
-        ACCEPTED_TABLE_ID,
-        _frame_to_records(accepted_new),
-        ACCEPTED_TRANSACTIONS_SCHEMA,
+        ACCEPTED_DATASET_ID, ACCEPTED_TABLE_ID,
+        _frame_to_records(accepted_new), ACCEPTED_TRANSACTIONS_SCHEMA,
     )
 
     quarantine_existing = bigquery_adapter.query_source_row_ids(
-        QUARANTINE_DATASET_ID,
-        QUARANTINE_TABLE_ID,
-        QUARANTINE_TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        QUARANTINE_DATASET_ID, QUARANTINE_TABLE_ID,
+        QUARANTINE_TRANSACTIONS_PARTITION_FIELD, batch_date,
     )
     quarantine_new = anti_filter_existing(result.quarantine, quarantine_existing)
     quarantine_inserted = bigquery_adapter.append_rows(
-        QUARANTINE_DATASET_ID,
-        QUARANTINE_TABLE_ID,
-        _frame_to_records(quarantine_new),
-        QUARANTINE_TRANSACTIONS_SCHEMA,
+        QUARANTINE_DATASET_ID, QUARANTINE_TABLE_ID,
+        _frame_to_records(quarantine_new), QUARANTINE_TRANSACTIONS_SCHEMA,
     )
 
     accepted_partition_rows = bigquery_adapter.query_partition_row_count(
-        ACCEPTED_DATASET_ID,
-        ACCEPTED_TABLE_ID,
-        ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        ACCEPTED_DATASET_ID, ACCEPTED_TABLE_ID,
+        ACCEPTED_TRANSACTIONS_PARTITION_FIELD, batch_date,
     )
     quarantine_partition_rows = bigquery_adapter.query_partition_row_count(
-        QUARANTINE_DATASET_ID,
-        QUARANTINE_TABLE_ID,
-        QUARANTINE_TRANSACTIONS_PARTITION_FIELD,
-        batch_date,
+        QUARANTINE_DATASET_ID, QUARANTINE_TABLE_ID,
+        QUARANTINE_TRANSACTIONS_PARTITION_FIELD, batch_date,
     )
-    reconciled = (
-        len(raw_frame) == accepted_partition_rows + quarantine_partition_rows
-    )
+    reconciled = len(raw_frame) == accepted_partition_rows + quarantine_partition_rows
     if not reconciled:
         raise ClassificationLoadError(
             "Persisted classification reconciliation failed: "
-            f"raw={len(raw_frame)} accepted={accepted_partition_rows} "
-            f"quarantine={quarantine_partition_rows}"
+            f"raw={len(raw_frame)} accepted={accepted_partition_rows} quarantine={quarantine_partition_rows}"
         )
-
     return ClassificationLoadSummary(
-        batch_date=batch_date.isoformat(),
-        raw_rows=len(raw_frame),
-        accepted_rows=len(result.accepted),
-        quarantine_rows=len(result.quarantine),
+        batch_date=batch_date.isoformat(), raw_rows=len(raw_frame),
+        accepted_rows=len(result.accepted), quarantine_rows=len(result.quarantine),
         accepted_inserted_rows=accepted_inserted,
         quarantine_inserted_rows=quarantine_inserted,
         accepted_partition_rows=accepted_partition_rows,
@@ -1384,57 +1188,13 @@ def classify_and_load_batch(
 
 - [ ] **Step 4: Re-run the first-run/rerun test and observe GREEN**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_classification_load.py::test_first_run_classifies_and_rerun_inserts_zero -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 5: Write the partial-retry test**
-
-Append:
-
-```python
-def test_partial_retry_skips_persisted_accepted_and_writes_missing_quarantine(
-    raw_rows_fixture,
-):
-    fake = StatefulBigQueryFake(raw_rows_fixture)
-    fake.fail_next_quarantine_append = True
-
-    with pytest.raises(RuntimeError, match="simulated quarantine write failure"):
-        classify_and_load_batch(
-            batch_date=date(2025, 7, 22),
-            bigquery_adapter=fake,
-            classified_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
-        )
-
-    assert len(fake.outputs[("bahtflow_analytics", "transactions_accepted")]) == 2
-    assert len(fake.outputs[("bahtflow_ops", "transactions_quarantine")]) == 0
-
-    retry = classify_and_load_batch(
-        batch_date=date(2025, 7, 22),
-        bigquery_adapter=fake,
-        classified_at=datetime(2026, 9, 2, 8, 5, tzinfo=timezone.utc),
-    )
-
-    assert retry.accepted_inserted_rows == 0
-    assert retry.quarantine_inserted_rows == 2
-    assert retry.reconciled is True
-```
-
-- [ ] **Step 6: Run the partial-retry test and observe GREEN**
-
-Run:
-
-```powershell
-pytest tests/pipeline/test_classification_load.py::test_partial_retry_skips_persisted_accepted_and_writes_missing_quarantine -v
-```
-
-Expected: PASS with the Task 5 implementation. If it fails, change only the idempotency/retry behavior demonstrated by this test; do not add rollback infrastructure.
-
-- [ ] **Step 7: Write the persisted-reconciliation failure test**
+- [ ] **Step 5: Add the partial-retry and persisted-reconciliation tests**
 
 Append:
 
@@ -1442,44 +1202,45 @@ Append:
 from pipeline.classification_load import ClassificationLoadError
 
 
-class MismatchedCountFake(StatefulBigQueryFake):
-    def query_partition_row_count(
-        self,
-        dataset_id,
-        table_id,
-        partition_field,
-        partition_date,
-    ):
-        count = super().query_partition_row_count(
-            dataset_id,
-            table_id,
-            partition_field,
-            partition_date,
+def test_partial_retry_skips_persisted_accepted_and_writes_missing_quarantine(raw_rows_fixture):
+    fake = StatefulBigQueryFake(raw_rows_fixture)
+    fake.fail_next_quarantine_append = True
+    with pytest.raises(RuntimeError, match="simulated quarantine write failure"):
+        classify_and_load_batch(
+            batch_date=date(2025, 7, 22), bigquery_adapter=fake,
+            classified_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
         )
-        if (dataset_id, table_id) == (
-            "bahtflow_analytics",
-            "transactions_accepted",
-        ):
+    assert len(fake.outputs[("bahtflow_analytics", "transactions_accepted")]) == 2
+    assert len(fake.outputs[("bahtflow_ops", "transactions_quarantine")]) == 0
+    retry = classify_and_load_batch(
+        batch_date=date(2025, 7, 22), bigquery_adapter=fake,
+        classified_at=datetime(2026, 9, 2, 8, 5, tzinfo=timezone.utc),
+    )
+    assert retry.accepted_inserted_rows == 0
+    assert retry.quarantine_inserted_rows == 2
+    assert retry.reconciled is True
+
+
+class MismatchedCountFake(StatefulBigQueryFake):
+    def query_partition_row_count(self, dataset_id, table_id, partition_field, partition_date):
+        count = super().query_partition_row_count(
+            dataset_id, table_id, partition_field, partition_date
+        )
+        if (dataset_id, table_id) == ("bahtflow_analytics", "transactions_accepted"):
             return count + 1
         return count
 
 
 def test_persisted_reconciliation_mismatch_fails(raw_rows_fixture):
     fake = MismatchedCountFake(raw_rows_fixture)
-    with pytest.raises(
-        ClassificationLoadError,
-        match="Persisted classification reconciliation failed",
-    ):
+    with pytest.raises(ClassificationLoadError, match="Persisted classification reconciliation failed"):
         classify_and_load_batch(
-            batch_date=date(2025, 7, 22),
-            bigquery_adapter=fake,
+            batch_date=date(2025, 7, 22), bigquery_adapter=fake,
             classified_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
         )
 ```
 
-- [ ] **Step 8: Run all F05 pipeline tests and observe GREEN**
-
-Run:
+- [ ] **Step 6: Run all F05 pipeline tests and observe GREEN**
 
 ```powershell
 pytest tests/pipeline/test_transaction_classification.py tests/pipeline/test_classification_load.py tests/pipeline/test_bigquery_adapter.py tests/pipeline/test_bigquery_contract.py -v
@@ -1487,7 +1248,7 @@ pytest tests/pipeline/test_transaction_classification.py tests/pipeline/test_cla
 
 Expected: all tests pass.
 
-- [ ] **Step 9: Commit Task 5**
+- [ ] **Step 7: Commit Task 5**
 
 ```powershell
 git add pipeline/classification_load.py tests/pipeline/test_classification_load.py
@@ -1503,7 +1264,7 @@ git commit -m "feat: persist classified transaction batches"
 - Create: `tests/scripts/test_classify_transactions.py`
 
 **Interfaces:**
-- Consumes: `load_gcp_settings()`, `BigQueryAdapter`, `classify_and_load_batch`.
+- Consumes `load_gcp_settings()`, `BigQueryAdapter`, and `classify_and_load_batch`.
 - Produces CLI `python -m scripts.classify_transactions --batch-date YYYY-MM-DD`.
 
 - [ ] **Step 1: Write the failing CLI test**
@@ -1517,36 +1278,21 @@ from scripts import classify_transactions as cli
 
 def test_cli_prints_classification_summary(monkeypatch, capsys):
     summary = ClassificationLoadSummary(
-        batch_date="2025-07-22",
-        raw_rows=4,
-        accepted_rows=2,
-        quarantine_rows=2,
-        accepted_inserted_rows=2,
-        quarantine_inserted_rows=2,
-        accepted_partition_rows=2,
-        quarantine_partition_rows=2,
-        reconciled=True,
+        batch_date="2025-07-22", raw_rows=4, accepted_rows=2, quarantine_rows=2,
+        accepted_inserted_rows=2, quarantine_inserted_rows=2,
+        accepted_partition_rows=2, quarantine_partition_rows=2, reconciled=True,
     )
     monkeypatch.setattr(cli, "run_classification", lambda batch_date: summary)
-
     cli.main(["--batch-date", "2025-07-22"])
-
     assert capsys.readouterr().out.splitlines() == [
-        "batch_date=2025-07-22",
-        "raw_rows=4",
-        "accepted_rows=2",
-        "quarantine_rows=2",
-        "accepted_inserted_rows=2",
-        "quarantine_inserted_rows=2",
-        "accepted_partition_rows=2",
-        "quarantine_partition_rows=2",
-        "reconciled=True",
+        "batch_date=2025-07-22", "raw_rows=4", "accepted_rows=2",
+        "quarantine_rows=2", "accepted_inserted_rows=2",
+        "quarantine_inserted_rows=2", "accepted_partition_rows=2",
+        "quarantine_partition_rows=2", "reconciled=True",
     ]
 ```
 
 - [ ] **Step 2: Run the CLI test and observe RED**
-
-Run:
 
 ```powershell
 pytest tests/scripts/test_classify_transactions.py -v
@@ -1554,7 +1300,7 @@ pytest tests/scripts/test_classify_transactions.py -v
 
 Expected: module import failure for `scripts.classify_transactions`.
 
-- [ ] **Step 3: Implement the dependency-light CLI**
+- [ ] **Step 3: Implement the CLI**
 
 Create `scripts/classify_transactions.py`:
 
@@ -1570,9 +1316,7 @@ from pipeline.config import load_gcp_settings
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Classify one raw BahtFlow transaction batch"
-    )
+    parser = argparse.ArgumentParser(description="Classify one raw BahtFlow transaction batch")
     parser.add_argument("--batch-date", required=True, type=date.fromisoformat)
     return parser.parse_args(argv)
 
@@ -1580,25 +1324,16 @@ def parse_args(argv=None):
 def run_classification(batch_date: date):
     settings = load_gcp_settings()
     adapter = BigQueryAdapter(settings.project_id)
-    return classify_and_load_batch(
-        batch_date=batch_date,
-        bigquery_adapter=adapter,
-    )
+    return classify_and_load_batch(batch_date=batch_date, bigquery_adapter=adapter)
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
     summary = run_classification(args.batch_date)
     fields = (
-        "batch_date",
-        "raw_rows",
-        "accepted_rows",
-        "quarantine_rows",
-        "accepted_inserted_rows",
-        "quarantine_inserted_rows",
-        "accepted_partition_rows",
-        "quarantine_partition_rows",
-        "reconciled",
+        "batch_date", "raw_rows", "accepted_rows", "quarantine_rows",
+        "accepted_inserted_rows", "quarantine_inserted_rows",
+        "accepted_partition_rows", "quarantine_partition_rows", "reconciled",
     )
     for field in fields:
         print(f"{field}={getattr(summary, field)}")
@@ -1609,8 +1344,6 @@ if __name__ == "__main__":
 ```
 
 - [ ] **Step 4: Run CLI and focused F05 tests and observe GREEN**
-
-Run:
 
 ```powershell
 pytest tests/scripts/test_classify_transactions.py tests/scripts/test_bootstrap_classification.py tests/pipeline/test_transaction_classification.py tests/pipeline/test_classification_load.py -v
@@ -1633,17 +1366,14 @@ git commit -m "feat: add transaction classification CLI"
 - Modify: `README.md`
 
 **Interfaces:**
-- Uses the F04 raw partition `2025-07-22`, currently expected to contain 8,978 rows.
-- Uses `scripts.bootstrap_classification` and `scripts.classify_transactions` through the `gcp-toolbox` Compose profile.
+- Uses the F04 raw partition `2025-07-22`, expected from observed F04 evidence to contain 8,978 rows.
 
-- [ ] **Step 1: Pull the branch locally and run the complete local gate before cloud writes**
+- [ ] **Step 1: Pull the feature branch and run the complete local gate before cloud writes**
 
 ```powershell
 git switch feat/05-pandas-dq-classification
 git pull --ff-only origin feat/05-pandas-dq-classification
-
 pytest
-
 python -m py_compile `
   pipeline/transaction_classification.py `
   pipeline/classification_load.py `
@@ -1651,14 +1381,13 @@ python -m py_compile `
   pipeline/bigquery_adapter.py `
   scripts/bootstrap_classification.py `
   scripts/classify_transactions.py
-
 docker compose config --quiet
 git diff --check
 git status --short
 git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
 ```
 
-Required: `pytest` has zero failures; compile/config/diff/credential checks are quiet; working tree is clean.
+Required: zero test failures; compile/config/diff/credential checks quiet; clean working tree.
 
 - [ ] **Step 2: Build the GCP toolbox**
 
@@ -1666,9 +1395,9 @@ Required: `pytest` has zero failures; compile/config/diff/credential checks are 
 docker compose --profile gcp build gcp-toolbox
 ```
 
-Expected: successful build with the already pinned F04 dependencies.
+Expected: successful build using the pinned dependencies.
 
-- [ ] **Step 3: Bootstrap the two F05 tables twice**
+- [ ] **Step 3: Bootstrap the two output tables twice**
 
 Run twice:
 
@@ -1677,9 +1406,9 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.bootstrap_classification
 ```
 
-On a fresh F05 setup the first run should report `created` for both tables and the second `verified`. If the first run already reports `verified`, do not delete tables or data automatically.
+Fresh first run: both `created`. Second run: both `verified`. If already `verified`, do not delete anything automatically.
 
-- [ ] **Step 4: Record raw and output partition pre-state**
+- [ ] **Step 4: Record source/output pre-state**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
@@ -1694,97 +1423,49 @@ accepted_before=0
 quarantine_before=0
 ```
 
-If either output partition is nonzero, stop and choose a fresh acceptance strategy explicitly; do not silently delete or overwrite classified data.
+If either output is nonzero, stop and explicitly choose another fresh acceptance strategy; do not silently delete or overwrite data.
 
-- [ ] **Step 5: Run the first live classification and record measured counts**
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -m scripts.classify_transactions --batch-date 2025-07-22
-```
-
-Required relationships:
-
-```text
-batch_date=2025-07-22
-raw_rows=8978
-accepted_inserted_rows=accepted_rows
-quarantine_inserted_rows=quarantine_rows
-accepted_partition_rows=accepted_rows
-quarantine_partition_rows=quarantine_rows
-reconciled=True
-8978 = accepted_rows + quarantine_rows
-```
-
-Do not predict accepted/quarantine counts before observing the live output.
-
-- [ ] **Step 6: Run the same classification command again for idempotency evidence**
+- [ ] **Step 5: Run first live classification and record measured counts**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.classify_transactions --batch-date 2025-07-22
 ```
 
-Required:
+Required relationships: `raw_rows=8978`, `accepted_inserted_rows=accepted_rows`, `quarantine_inserted_rows=quarantine_rows`, persisted output counts equal their classified counts, `reconciled=True`, and `8978 = accepted_rows + quarantine_rows`. Do not predict accepted/quarantine counts before observing them.
 
-```text
-raw_rows=8978
-accepted_inserted_rows=0
-quarantine_inserted_rows=0
-accepted_partition_rows=<same measured first-run accepted count>
-quarantine_partition_rows=<same measured first-run quarantine count>
-reconciled=True
-```
-
-- [ ] **Step 7: Query typed accepted samples and raw quarantine evidence**
+- [ ] **Step 6: Run the same command again for idempotency evidence**
 
 ```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "from pipeline.config import load_gcp_settings; from google.cloud import bigquery; s=load_gcp_settings(); c=bigquery.Client(project=s.project_id); a=list(c.query('SELECT txn, transaction_dt, amount, currency, region, source_row_id FROM `'+s.project_id+'.bahtflow_analytics.transactions_accepted` WHERE batch_date=DATE(\"2025-07-22\") ORDER BY source_file, source_row_number LIMIT 5').result()); q=list(c.query('SELECT txn, dtts, amount, currency, reason_codes, source_row_id FROM `'+s.project_id+'.bahtflow_ops.transactions_quarantine` WHERE batch_date=DATE(\"2025-07-22\") AND ARRAY_LENGTH(reason_codes)>0 ORDER BY source_file, source_row_number LIMIT 5').result()); print('accepted_sample_rows=',len(a)); print('accepted_sample=',[tuple(r) for r in a]); print('quarantine_sample_rows=',len(q)); print('quarantine_sample=',[tuple(r) for r in q])"
-```
-
-Evidence required:
-- accepted sample exposes timezone-free `DATETIME` values;
-- accepted amounts are numeric, not malformed raw strings;
-- accepted currencies are only `THB`, `USD`, `EUR`;
-- quarantine samples retain raw business values and every sampled reason array is non-empty.
-
-- [ ] **Step 8: Query reason distribution and verify live duplicate examples when present**
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "from pipeline.config import load_gcp_settings; from google.cloud import bigquery; s=load_gcp_settings(); c=bigquery.Client(project=s.project_id); q='SELECT reason, COUNT(*) FROM `'+s.project_id+'.bahtflow_ops.transactions_quarantine`, UNNEST(reason_codes) reason WHERE batch_date=DATE(\"2025-07-22\") GROUP BY reason ORDER BY reason'; print([tuple(r) for r in c.query(q).result()])"
-```
-
-If `DUPLICATE_REPLAY` is present, select one replay txn and verify exactly one accepted winner in the same batch. If `DUPLICATE_CONFLICT` is present, select one conflict txn and verify zero accepted rows for that txn in the same batch. If a case is absent from the live fixture, state that the live batch lacks the case and use the unit-test evidence for that rule.
-
-- [ ] **Step 9: Add the Feature 05 README runbook**
-
-Add section:
-
-```markdown
-## Feature 05: Pandas data-quality classification
-```
-
-Include these commands:
-
-```powershell
-docker compose --profile gcp run --rm gcp-toolbox `
-  python -m scripts.bootstrap_classification
-
 docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.classify_transactions --batch-date 2025-07-22
 ```
 
-Document explicitly:
-- accepted is typed/canonical in `bahtflow_analytics.transactions_accepted`;
-- quarantine preserves raw business values and ordered reason codes in `bahtflow_ops.transactions_quarantine`;
-- duplicate scope is batch-local in v1;
-- base-invalid rows do not enter duplicate comparison;
-- unchanged reruns insert zero rows;
-- F05 stops before FX/F06 and Airflow/F07.
+Required: accepted/quarantine inserted rows both `0`, persisted counts unchanged, `reconciled=True`.
 
-- [ ] **Step 10: Commit the README runbook**
+- [ ] **Step 7: Query typed accepted and raw quarantine samples**
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -c "from pipeline.config import load_gcp_settings; from google.cloud import bigquery; s=load_gcp_settings(); c=bigquery.Client(project=s.project_id); a=list(c.query('SELECT txn, transaction_dt, amount, currency, region, source_row_id FROM `'+s.project_id+'.bahtflow_analytics.transactions_accepted` WHERE batch_date=DATE(\"2025-07-22\") ORDER BY source_file, source_row_number LIMIT 5').result()); q=list(c.query('SELECT txn, dtts, amount, currency, reason_codes, source_row_id FROM `'+s.project_id+'.bahtflow_ops.transactions_quarantine` WHERE batch_date=DATE(\"2025-07-22\") AND ARRAY_LENGTH(reason_codes)>0 ORDER BY source_file, source_row_number LIMIT 5').result()); print('accepted_sample=',[tuple(r) for r in a]); print('quarantine_sample=',[tuple(r) for r in q])"
+```
+
+Verify accepted `DATETIME`, numeric amount, canonical currency, and non-empty quarantine reason arrays while raw quarantine business values remain uncanonicalized.
+
+- [ ] **Step 8: Query reason distribution and duplicate semantics without assuming a live case exists**
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -c "from pipeline.config import load_gcp_settings; from google.cloud import bigquery; s=load_gcp_settings(); c=bigquery.Client(project=s.project_id); base=s.project_id; dist='SELECT reason, COUNT(*) count FROM `'+base+'.bahtflow_ops.transactions_quarantine`, UNNEST(reason_codes) reason WHERE batch_date=DATE(\"2025-07-22\") GROUP BY reason ORDER BY reason'; replay='SELECT q.txn, (SELECT COUNT(*) FROM `'+base+'.bahtflow_analytics.transactions_accepted` a WHERE a.batch_date=DATE(\"2025-07-22\") AND a.txn=TRIM(q.txn)) accepted_count FROM `'+base+'.bahtflow_ops.transactions_quarantine` q WHERE q.batch_date=DATE(\"2025-07-22\") AND \"DUPLICATE_REPLAY\" IN UNNEST(q.reason_codes) LIMIT 1'; conflict='SELECT q.txn, (SELECT COUNT(*) FROM `'+base+'.bahtflow_analytics.transactions_accepted` a WHERE a.batch_date=DATE(\"2025-07-22\") AND a.txn=TRIM(q.txn)) accepted_count FROM `'+base+'.bahtflow_ops.transactions_quarantine` q WHERE q.batch_date=DATE(\"2025-07-22\") AND \"DUPLICATE_CONFLICT\" IN UNNEST(q.reason_codes) LIMIT 1'; print('reason_counts=',[tuple(r) for r in c.query(dist).result()]); print('replay_evidence=',[tuple(r) for r in c.query(replay).result()]); print('conflict_evidence=',[tuple(r) for r in c.query(conflict).result()])"
+```
+
+If replay evidence exists, `accepted_count` must be `1`. If conflict evidence exists, `accepted_count` must be `0`. An empty result means that live batch lacks that case; retain unit-test evidence instead of fabricating a live example.
+
+- [ ] **Step 9: Add the README runbook**
+
+Add `## Feature 05: Pandas data-quality classification` with the exact bootstrap/classification commands above and state: accepted is typed/canonical; quarantine preserves raw values + ordered reasons; duplicate scope is batch-local v1; base-invalid rows do not enter duplicate comparison; unchanged reruns insert zero; F05 stops before FX/F06 and Airflow/F07.
+
+- [ ] **Step 10: Commit README**
 
 ```powershell
 git add README.md
@@ -1793,49 +1474,18 @@ git commit -m "docs: add Feature 05 classification runbook"
 
 - [ ] **Step 11: Run the fresh final local gate**
 
-```powershell
-pytest
+Repeat Step 1 verification commands after the README commit. Required: zero test failures and all non-test checks clean/quiet.
 
-python -m py_compile `
-  pipeline/transaction_classification.py `
-  pipeline/classification_load.py `
-  pipeline/bigquery_contract.py `
-  pipeline/bigquery_adapter.py `
-  scripts/bootstrap_classification.py `
-  scripts/classify_transactions.py
-
-docker compose config --quiet
-git diff --check
-git status --short
-git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
-```
-
-Required: zero test failures and all non-test checks clean/quiet.
-
-- [ ] **Step 12: Review the final diff before integration**
+- [ ] **Step 12: Review the final diff**
 
 ```powershell
 git diff main...feat/05-pandas-dq-classification --stat
-git diff main...feat/05-pandas-dq-classification -- `
-  pipeline/transaction_classification.py `
-  pipeline/classification_load.py `
-  pipeline/bigquery_contract.py `
-  pipeline/bigquery_adapter.py `
-  scripts/bootstrap_classification.py `
-  scripts/classify_transactions.py `
-  README.md
+git diff main...feat/05-pandas-dq-classification -- pipeline/transaction_classification.py pipeline/classification_load.py pipeline/bigquery_contract.py pipeline/bigquery_adapter.py scripts/bootstrap_classification.py scripts/classify_transactions.py README.md
 ```
 
-Review specifically for:
-- business classification accidentally implemented in BigQuery SQL;
-- global cross-batch duplicate behavior;
-- timezone assumptions applied to `transaction_dt`;
-- float conversion of monetary values;
-- destructive partition replacement or `MERGE`;
-- canonical values replacing raw business values in quarantine;
-- FX/F06 or Airflow/F07 feature creep.
+Reject the diff if it contains business classification in BigQuery SQL, cross-batch duplicate behavior, timezone assumptions on `transaction_dt`, float money conversion, destructive partition replacement/`MERGE`, canonical values overwriting raw quarantine fields, or FX/Airflow feature creep.
 
-Only after fresh live evidence, a fresh full local gate, and Review Diff are clean should F05 enter the finishing/integration workflow.
+Only after fresh live evidence, a fresh full local gate, and Review Diff are clean should F05 enter finishing/integration.
 
 ## Final F05 Acceptance Gate
 
