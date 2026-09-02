@@ -6,6 +6,7 @@ import pytest
 
 from pipeline.transaction_classification import (
     TransactionClassificationError,
+    classify_transactions,
     validate_and_canonicalize_transactions,
 )
 
@@ -153,3 +154,51 @@ def test_missing_required_raw_column_fails_explicitly():
 
     with pytest.raises(TransactionClassificationError, match="source_row_id"):
         validate_and_canonicalize_transactions(frame, date(2025, 7, 22))
+
+
+def test_exact_replay_accepts_lowest_source_lineage():
+    frame = pd.DataFrame(
+        [
+            raw_row(
+                txn="TX-R",
+                source_row_id="north",
+                source_file=(
+                    "transactions/business_date=2025-07-22/"
+                    "sales_north_20250722.csv.gz"
+                ),
+                source_row_number=1,
+            ),
+            raw_row(
+                txn="TX-R",
+                source_row_id="bkk-later",
+                source_file=(
+                    "transactions/business_date=2025-07-22/"
+                    "sales_bkk_20250722.csv.gz"
+                ),
+                source_row_number=11,
+            ),
+            raw_row(
+                txn=" TX-R ",
+                source_row_id="winner",
+                source_file=(
+                    "transactions/business_date=2025-07-22/"
+                    "sales_bkk_20250722.csv.gz"
+                ),
+                source_row_number=10,
+            ),
+        ]
+    )
+
+    result = classify_transactions(
+        frame,
+        date(2025, 7, 22),
+        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.accepted["source_row_id"].tolist() == ["winner"]
+    quarantine = result.quarantine.sort_values("source_row_id").reset_index(drop=True)
+    assert quarantine["source_row_id"].tolist() == ["bkk-later", "north"]
+    assert quarantine["reason_codes"].tolist() == [
+        ["DUPLICATE_REPLAY"],
+        ["DUPLICATE_REPLAY"],
+    ]
