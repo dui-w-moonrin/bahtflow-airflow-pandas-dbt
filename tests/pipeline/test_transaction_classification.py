@@ -4,6 +4,7 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
+import pipeline.transaction_classification as classification
 from pipeline.transaction_classification import (
     TransactionClassificationError,
     classify_transactions,
@@ -264,3 +265,24 @@ def test_base_invalid_row_does_not_poison_valid_duplicate_candidate():
     assert result.accepted["source_row_id"].tolist() == ["valid"]
     assert result.quarantine["source_row_id"].tolist() == ["malformed"]
     assert result.quarantine["reason_codes"].tolist() == [["INVALID_AMOUNT"]]
+
+
+def test_classify_duplicates_is_public_and_returns_duplicate_reasons():
+    validated = validate_and_canonicalize_transactions(
+        pd.DataFrame(
+            [
+                raw_row(txn="TX-P", source_row_id="first", source_row_number=1),
+                raw_row(txn=" TX-P ", source_row_id="second", source_row_number=2),
+            ]
+        ),
+        date(2025, 7, 22),
+    )
+    valid = validated[validated["_base_reason_codes"].map(len).eq(0)].copy()
+
+    accepted, duplicate_quarantine = classification.classify_duplicates(valid)
+
+    assert accepted["source_row_id"].tolist() == ["first"]
+    assert duplicate_quarantine["source_row_id"].tolist() == ["second"]
+    assert duplicate_quarantine["_duplicate_reason"].tolist() == [
+        "DUPLICATE_REPLAY"
+    ]
