@@ -1,30 +1,7 @@
 from pathlib import Path
-import re
 
 
 DAG_PATH = Path(__file__).parents[2] / "airflow" / "dags" / "bahtflow_daily.py"
-
-EXPECTED_TASK_IDS = {
-    "start",
-    "discover_tx_files",
-    "validate_tx_files",
-    "load_tx_raw",
-    "discover_fx",
-    "validate_fx",
-    "load_fx_raw",
-    "dbt_transform",
-    "dbt_test",
-    "reconcile",
-    "finish",
-}
-
-EXPECTED_DEPENDENCIES = {
-    "start >> [discover_tx_files, discover_fx]",
-    "discover_tx_files >> validate_tx_files >> load_tx_raw",
-    "discover_fx >> validate_fx >> load_fx_raw",
-    "[load_tx_raw, load_fx_raw] >> dbt_transform",
-    "dbt_transform >> dbt_test >> reconcile >> finish",
-}
 
 
 def _source() -> str:
@@ -35,26 +12,59 @@ def test_dag_file_exists():
     assert DAG_PATH.is_file()
 
 
-def test_dag_uses_airflow3_empty_operator_contract():
+def test_dag_uses_airflow3_taskflow_api():
     source = _source()
-    assert "from airflow.sdk import DAG" in source
-    assert (
-        "from airflow.providers.standard.operators.empty import EmptyOperator"
-        in source
-    )
-
-    task_ids = set(re.findall(r'EmptyOperator\(task_id="([^"]+)"\)', source))
-    assert task_ids == EXPECTED_TASK_IDS
+    assert "from airflow.sdk import dag, get_current_context, task" in source
+    assert "@dag(" in source
+    assert "@task" in source
+    assert "dbt_transform" not in source
+    assert "dbt_test" not in source
 
 
-def test_dag_schedule_and_timezone_are_explicit():
+def test_dag_operational_contract():
     source = _source()
-    assert 'schedule="@daily"' in source
-    assert "catchup=False" in source
-    assert 'tz="Asia/Bangkok"' in source
+    for text in (
+        'schedule="@daily"',
+        "catchup=False",
+        "max_active_runs=1",
+        '"retries": 2',
+        "timedelta(minutes=2)",
+        'tz="Asia/Bangkok"',
+    ):
+        assert text in source
 
 
-def test_dag_dependency_contract_matches_pipeline_shape():
+def test_dag_has_exact_f07_task_ids():
+    source = _source()
+    for task_id in (
+        "resolve_batch_date",
+        "preflight",
+        "load_tx_raw",
+        "load_fx_raw",
+        "classify_transactions",
+        "build_currency_fact",
+        "finish",
+    ):
+        assert f'task_id="{task_id}"' in source
+
+
+def test_dag_uses_pipeline_services_without_dataframe_business_logic():
+    source = _source()
+    for symbol in (
+        "load_transaction_raw_batch",
+        "load_fx_raw_batch",
+        "classify_and_load_batch",
+        "build_and_load_currency_fact",
+        "run_preflight",
+    ):
+        assert symbol in source
+    assert "pd.DataFrame" not in source
+    assert "resolve_effective_fx" not in source
+
+
+def test_dependency_edges_match_f07():
     normalized = "\n".join(line.strip() for line in _source().splitlines())
-    for dependency in EXPECTED_DEPENDENCIES:
-        assert dependency in normalized
+    assert "ready >> [tx_raw, fx_raw]" in normalized
+    assert "tx_raw >> classified" in normalized
+    assert "[classified, fx_raw] >> fact" in normalized
+    assert "fact >> finish" in normalized
