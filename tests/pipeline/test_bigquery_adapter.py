@@ -288,3 +288,55 @@ def test_query_rows_through_date_is_parameterized_and_returns_dicts():
     assert parameter.name == "through_date"
     assert parameter.type_ == "DATE"
     assert parameter.value == date(2025, 7, 22)
+
+
+def test_validate_dataset_returns_verified_for_existing_match():
+    client = FakeClient()
+    dataset = bigquery.Dataset("proj.bahtflow_raw")
+    dataset.location = "asia-southeast1"
+    client.datasets["proj.bahtflow_raw"] = dataset
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert adapter.validate_dataset("bahtflow_raw", "ASIA-SOUTHEAST1") == "verified"
+
+
+def test_validate_dataset_missing_fails_without_creation():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+
+    with pytest.raises(BigQueryContractError, match="Dataset does not exist"):
+        adapter.validate_dataset("bahtflow_raw", "asia-southeast1")
+
+    assert client.datasets == {}
+
+
+def test_validate_partitioned_table_returns_verified_for_existing_match():
+    client = FakeClient()
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+    table = bigquery.Table("proj.bahtflow_raw.transactions", schema=list(schema))
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="batch_date",
+    )
+    client.tables["proj.bahtflow_raw.transactions"] = table
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert (
+        adapter.validate_partitioned_table(
+            "bahtflow_raw", "transactions", schema, "batch_date"
+        )
+        == "verified"
+    )
+
+
+def test_validate_partitioned_table_missing_fails_without_creation():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+
+    with pytest.raises(BigQueryContractError, match="Table does not exist"):
+        adapter.validate_partitioned_table(
+            "bahtflow_raw", "transactions", schema, "batch_date"
+        )
+
+    assert client.tables == {}
