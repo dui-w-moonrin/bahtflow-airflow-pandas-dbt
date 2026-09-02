@@ -20,6 +20,14 @@ class FakeLoadJob:
         return self
 
 
+class FakeMappingRow:
+    def __init__(self, values):
+        self._values = values
+
+    def items(self):
+        return self._values.items()
+
+
 class FakeClient:
     def __init__(self):
         self.datasets = {}
@@ -240,5 +248,32 @@ def test_query_partition_row_count_is_partition_scoped():
     assert count == 8978
     sql, job_config = client.query_calls[-1]
     assert "SELECT COUNT(*)" in sql
+    assert "WHERE batch_date = @partition_date" in sql
+    assert job_config.query_parameters[0].value == date(2025, 7, 22)
+
+
+def test_query_partition_rows_selects_requested_columns_and_returns_dicts():
+    client = FakeClient()
+    client.query_rows = [
+        FakeMappingRow({"txn": "TX-1", "source_row_id": "row-1"}),
+        FakeMappingRow({"txn": "TX-2", "source_row_id": "row-2"}),
+    ]
+    adapter = BigQueryAdapter("proj", client=client)
+
+    rows = adapter.query_partition_rows(
+        "bahtflow_raw",
+        "transactions",
+        "batch_date",
+        date(2025, 7, 22),
+        ("txn", "source_row_id"),
+    )
+
+    assert rows == [
+        {"txn": "TX-1", "source_row_id": "row-1"},
+        {"txn": "TX-2", "source_row_id": "row-2"},
+    ]
+    sql, job_config = client.query_calls[-1]
+    assert "SELECT txn, source_row_id" in sql
+    assert "`proj.bahtflow_raw.transactions`" in sql
     assert "WHERE batch_date = @partition_date" in sql
     assert job_config.query_parameters[0].value == date(2025, 7, 22)
