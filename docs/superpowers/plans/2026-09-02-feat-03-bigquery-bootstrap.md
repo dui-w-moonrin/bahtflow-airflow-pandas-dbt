@@ -20,10 +20,10 @@
 - Do not add Pandas transformation or business-quality logic in F03.
 - Do not add dbt; dbt is deferred to v2.
 - Reuse `BAHTFLOW_GCP_PROJECT` and `BAHTFLOW_GCP_LOCATION`; add no dataset-name environment variables.
-- Python BigQuery clients must use normal ADC with explicit `project=settings.project_id`; no service-account key files.
+- Python BigQuery clients use normal ADC with explicit `project=settings.project_id`; no service-account key files.
 - Existing dataset location mismatch is a hard failure.
-- Existing raw table schema or partition mismatch is a hard failure; bootstrap must never silently replace a mismatched table.
-- F03 bootstrap is rerun-safe: unchanged resources are verified/skipped, not recreated destructively.
+- Existing raw table schema or partition mismatch is a hard failure; bootstrap never silently replaces a mismatched table.
+- F03 bootstrap is rerun-safe: unchanged resources are verified, not recreated destructively.
 - Runtime permissions stay below BigQuery Admin. For thin v1, use project-scoped `roles/bigquery.user` and `roles/bigquery.dataEditor` on the dedicated BahtFlow project.
 
 ---
@@ -32,12 +32,12 @@
 
 - Modify: `requirements-gcp.txt` — add pinned BigQuery client dependency.
 - Create: `pipeline/bigquery_contract.py` — dataset IDs, raw table schemas, partition fields.
-- Create: `pipeline/bigquery_adapter.py` — narrow network adapter for create/verify operations.
+- Create: `pipeline/bigquery_adapter.py` — narrow network adapter for create/verify/read/query operations needed by F03.
 - Create: `scripts/bootstrap_bigquery.py` — idempotent bootstrap CLI.
 - Create: `scripts/verify_bigquery_live.py` — read-only live acceptance verifier.
 - Modify: `README.md` — BigQuery API/IAM/bootstrap/verify commands only.
 - Create: `tests/pipeline/test_bigquery_contract.py` — exact schema/partition contract tests.
-- Create: `tests/pipeline/test_bigquery_adapter.py` — credential-free create/verify/drift tests with fake client.
+- Create: `tests/pipeline/test_bigquery_adapter.py` — credential-free create/verify/drift/query tests with a fake client.
 
 ---
 
@@ -50,7 +50,7 @@
 
 **Interfaces:**
 - Consumes: existing `GcpSettings.project_id` and `GcpSettings.location` from `pipeline.config`.
-- Produces: `DATASET_IDS: tuple[str, ...]`, `TRANSACTIONS_SCHEMA`, `FX_RATES_SCHEMA`, `TRANSACTIONS_PARTITION_FIELD`, `FX_RATES_PARTITION_FIELD`.
+- Produces: `DATASET_IDS`, `TRANSACTIONS_SCHEMA`, `FX_RATES_SCHEMA`, `TRANSACTIONS_PARTITION_FIELD`, `FX_RATES_PARTITION_FIELD`.
 
 - [ ] **Step 1: Add the failing contract test**
 
@@ -115,8 +115,6 @@ def test_fx_raw_schema_and_partition_contract():
 
 - [ ] **Step 2: Run the focused test and confirm RED**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py -v
 ```
@@ -176,9 +174,7 @@ FX_RATES_SCHEMA = (
 FX_RATES_PARTITION_FIELD = "rate_date"
 ```
 
-- [ ] **Step 4: Install/rebuild the toolbox dependency and run GREEN**
-
-Run locally in the venv after dependency install, or rebuild the toolbox before Docker verification:
+- [ ] **Step 4: Install the dependency and run GREEN**
 
 ```powershell
 pip install -r requirements-gcp.txt
@@ -196,32 +192,173 @@ git commit -m "feat: define BigQuery raw contract"
 
 ---
 
-### Task 2: Add Rerun-Safe BigQuery Adapter
+### Task 2: Add the Rerun-Safe BigQuery Adapter
 
 **Files:**
 - Create: `pipeline/bigquery_adapter.py`
 - Create: `tests/pipeline/test_bigquery_adapter.py`
 
 **Interfaces:**
-- Consumes: `project_id: str`, dataset IDs, schema tuples, partition fields.
-- Produces: `BigQueryAdapter(project_id, client=None)`, `ensure_dataset(dataset_id, location) -> str`, `ensure_partitioned_table(dataset_id, table_id, schema, partition_field) -> str`, `get_table(...)`.
-- Return values are exactly `"created"` or `"verified"` for ensure operations.
+- Consumes: `project_id: str`, dataset IDs, BigQuery schema fields, partition field names.
+- Produces: `BigQueryAdapter(project_id, client=None)`, `ensure_dataset(dataset_id, location) -> str`, `ensure_partitioned_table(dataset_id, table_id, schema, partition_field) -> str`, `get_dataset(dataset_id)`, `get_table(dataset_id, table_id)`, `query_scalar(sql) -> int`.
+- Ensure methods return exactly `"created"` or `"verified"`.
 
-- [ ] **Step 1: Write credential-free failing tests with a fake client**
-
-The fake client only needs `get_dataset`, `create_dataset`, `get_table`, and `create_table`. Tests must cover these cases:
+- [ ] **Step 1: Write the credential-free failing tests**
 
 ```python
-def test_missing_dataset_is_created_in_expected_location(): ...
-def test_existing_dataset_same_location_is_verified(): ...
-def test_existing_dataset_wrong_location_fails(): ...
-def test_missing_partitioned_table_is_created(): ...
-def test_existing_table_exact_schema_and_partition_is_verified(): ...
-def test_existing_table_schema_drift_fails(): ...
-def test_existing_table_partition_drift_fails(): ...
-```
+# tests/pipeline/test_bigquery_adapter.py
+from types import SimpleNamespace
 
-Use `google.api_core.exceptions.NotFound("missing")` from the fake for absent resources. Build fake dataset/table objects with the same attributes the adapter reads (`dataset_id`, `location`, `schema`, `time_partitioning`). Do not call the network.
+import pytest
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery
+
+from pipeline.bigquery_adapter import BigQueryAdapter, BigQueryContractError
+
+
+class FakeQueryJob:
+    def __init__(self, value):
+        self._value = value
+
+    def result(self):
+        return [(self._value,)]
+
+
+class FakeClient:
+    def __init__(self):
+        self.datasets = {}
+        self.tables = {}
+        self.query_value = 0
+
+    def get_dataset(self, full_id):
+        if full_id not in self.datasets:
+            raise NotFound("missing dataset")
+        return self.datasets[full_id]
+
+    def create_dataset(self, dataset):
+        self.datasets[dataset.full_dataset_id.replace(":", ".")] = dataset
+        return dataset
+
+    def get_table(self, full_id):
+        if full_id not in self.tables:
+            raise NotFound("missing table")
+        return self.tables[full_id]
+
+    def create_table(self, table):
+        self.tables[table.full_table_id.replace(":", ".")] = table
+        return table
+
+    def query(self, sql):
+        return FakeQueryJob(self.query_value)
+
+
+def test_missing_dataset_is_created_in_expected_location():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert adapter.ensure_dataset("bahtflow_raw", "asia-southeast1") == "created"
+    assert client.datasets["proj.bahtflow_raw"].location == "asia-southeast1"
+
+
+def test_existing_dataset_same_location_is_verified():
+    client = FakeClient()
+    dataset = bigquery.Dataset("proj.bahtflow_raw")
+    dataset.location = "asia-southeast1"
+    client.datasets["proj.bahtflow_raw"] = dataset
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert adapter.ensure_dataset("bahtflow_raw", "ASIA-SOUTHEAST1") == "verified"
+
+
+def test_existing_dataset_wrong_location_fails():
+    client = FakeClient()
+    dataset = bigquery.Dataset("proj.bahtflow_raw")
+    dataset.location = "US"
+    client.datasets["proj.bahtflow_raw"] = dataset
+    adapter = BigQueryAdapter("proj", client=client)
+
+    with pytest.raises(BigQueryContractError, match="Dataset location mismatch"):
+        adapter.ensure_dataset("bahtflow_raw", "asia-southeast1")
+
+
+def test_missing_partitioned_table_is_created():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+
+    status = adapter.ensure_partitioned_table(
+        "bahtflow_raw", "transactions", schema, "batch_date"
+    )
+
+    assert status == "created"
+    table = client.tables["proj.bahtflow_raw.transactions"]
+    assert table.time_partitioning.field == "batch_date"
+    assert table.time_partitioning.type_ == "DAY"
+
+
+def test_existing_table_exact_schema_and_partition_is_verified():
+    client = FakeClient()
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+    table = bigquery.Table("proj.bahtflow_raw.transactions", schema=list(schema))
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="batch_date",
+    )
+    client.tables["proj.bahtflow_raw.transactions"] = table
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert (
+        adapter.ensure_partitioned_table(
+            "bahtflow_raw", "transactions", schema, "batch_date"
+        )
+        == "verified"
+    )
+
+
+def test_existing_table_schema_drift_fails():
+    client = FakeClient()
+    expected = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+    table = bigquery.Table(
+        "proj.bahtflow_raw.transactions",
+        schema=[bigquery.SchemaField("wrong", "STRING")],
+    )
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="batch_date",
+    )
+    client.tables["proj.bahtflow_raw.transactions"] = table
+    adapter = BigQueryAdapter("proj", client=client)
+
+    with pytest.raises(BigQueryContractError, match="Table schema mismatch"):
+        adapter.ensure_partitioned_table(
+            "bahtflow_raw", "transactions", expected, "batch_date"
+        )
+
+
+def test_existing_table_partition_drift_fails():
+    client = FakeClient()
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+    table = bigquery.Table("proj.bahtflow_raw.transactions", schema=list(schema))
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="wrong_date",
+    )
+    client.tables["proj.bahtflow_raw.transactions"] = table
+    adapter = BigQueryAdapter("proj", client=client)
+
+    with pytest.raises(BigQueryContractError, match="Table partition mismatch"):
+        adapter.ensure_partitioned_table(
+            "bahtflow_raw", "transactions", schema, "batch_date"
+        )
+
+
+def test_query_scalar_returns_first_value_as_int():
+    client = FakeClient()
+    client.query_value = 17
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert adapter.query_scalar("SELECT 17") == 17
+```
 
 - [ ] **Step 2: Run focused tests and confirm RED**
 
@@ -229,11 +366,9 @@ Use `google.api_core.exceptions.NotFound("missing")` from the fake for absent re
 pytest tests/pipeline/test_bigquery_adapter.py -v
 ```
 
-Expected: import failure because `pipeline.bigquery_adapter` does not exist.
+Expected: collection/import failure because `pipeline.bigquery_adapter` does not exist.
 
 - [ ] **Step 3: Implement the minimal adapter**
-
-The implementation must follow this shape:
 
 ```python
 # pipeline/bigquery_adapter.py
@@ -243,6 +378,10 @@ from google.cloud import bigquery
 
 class BigQueryContractError(RuntimeError):
     pass
+
+
+def _schema_shape(schema):
+    return [(field.name, field.field_type, field.mode) for field in schema]
 
 
 class BigQueryAdapter:
@@ -286,32 +425,33 @@ class BigQueryAdapter:
             self._client.create_table(table)
             return "created"
 
-        expected_shape = [
-            (field.name, field.field_type, field.mode) for field in schema
-        ]
-        actual_shape = [
-            (field.name, field.field_type, field.mode) for field in existing.schema
-        ]
-        if actual_shape != expected_shape:
+        if _schema_shape(existing.schema) != _schema_shape(schema):
             raise BigQueryContractError(f"Table schema mismatch for {full_id}")
 
         actual_partition = getattr(existing.time_partitioning, "field", None)
-        if actual_partition != partition_field:
+        actual_partition_type = getattr(existing.time_partitioning, "type_", None)
+        if actual_partition != partition_field or actual_partition_type != "DAY":
             raise BigQueryContractError(
                 f"Table partition mismatch for {full_id}: "
-                f"expected={partition_field} actual={actual_partition}"
+                f"expected=DAY:{partition_field} "
+                f"actual={actual_partition_type}:{actual_partition}"
             )
         return "verified"
+
+    def get_dataset(self, dataset_id: str):
+        return self._client.get_dataset(f"{self._project_id}.{dataset_id}")
 
     def get_table(self, dataset_id: str, table_id: str):
         return self._client.get_table(
             f"{self._project_id}.{dataset_id}.{table_id}"
         )
+
+    def query_scalar(self, sql: str) -> int:
+        rows = self._client.query(sql).result()
+        return int(next(iter(rows))[0])
 ```
 
-Do not add update/delete methods in F03.
-
-- [ ] **Step 4: Run adapter tests and contract tests**
+- [ ] **Step 4: Run focused tests and confirm GREEN**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py tests/pipeline/test_bigquery_contract.py -v
@@ -328,7 +468,7 @@ git commit -m "feat: add rerun-safe BigQuery adapter"
 
 ---
 
-### Task 3: Add Bootstrap CLI and Live Verification
+### Task 3: Add Bootstrap CLI, Live Verifier, and Thin Runbook
 
 **Files:**
 - Create: `scripts/bootstrap_bigquery.py`
@@ -337,68 +477,117 @@ git commit -m "feat: add rerun-safe BigQuery adapter"
 
 **Interfaces:**
 - Consumes: `load_gcp_settings()`, `DATASET_IDS`, raw schemas/partition fields, `BigQueryAdapter`.
-- Produces: one bootstrap command and one read-only live verifier.
+- Produces: `python -m scripts.bootstrap_bigquery` and `python -m scripts.verify_bigquery_live`.
 
 - [ ] **Step 1: Add the bootstrap CLI**
 
-Create `scripts/bootstrap_bigquery.py` with a `main()` that:
+```python
+# scripts/bootstrap_bigquery.py
+from pipeline.bigquery_adapter import BigQueryAdapter
+from pipeline.bigquery_contract import (
+    DATASET_IDS,
+    FX_RATES_PARTITION_FIELD,
+    FX_RATES_SCHEMA,
+    TRANSACTIONS_PARTITION_FIELD,
+    TRANSACTIONS_SCHEMA,
+)
+from pipeline.config import load_gcp_settings
+
+
+def main() -> None:
+    settings = load_gcp_settings()
+    adapter = BigQueryAdapter(settings.project_id)
+
+    for dataset_id in DATASET_IDS:
+        status = adapter.ensure_dataset(dataset_id, settings.location)
+        print(f"dataset={dataset_id} status={status}")
+
+    status = adapter.ensure_partitioned_table(
+        "bahtflow_raw",
+        "transactions",
+        TRANSACTIONS_SCHEMA,
+        TRANSACTIONS_PARTITION_FIELD,
+    )
+    print(f"table=bahtflow_raw.transactions status={status}")
+
+    status = adapter.ensure_partitioned_table(
+        "bahtflow_raw",
+        "fx_rates",
+        FX_RATES_SCHEMA,
+        FX_RATES_PARTITION_FIELD,
+    )
+    print(f"table=bahtflow_raw.fx_rates status={status}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 2: Add the read-only live verifier**
 
 ```python
-settings = load_gcp_settings()
-adapter = BigQueryAdapter(settings.project_id)
-
-for dataset_id in DATASET_IDS:
-    status = adapter.ensure_dataset(dataset_id, settings.location)
-    print(f"dataset={dataset_id} status={status}")
-
-status = adapter.ensure_partitioned_table(
-    "bahtflow_raw",
-    "transactions",
-    TRANSACTIONS_SCHEMA,
+# scripts/verify_bigquery_live.py
+from pipeline.bigquery_adapter import BigQueryAdapter, BigQueryContractError
+from pipeline.bigquery_contract import (
+    DATASET_IDS,
+    FX_RATES_PARTITION_FIELD,
     TRANSACTIONS_PARTITION_FIELD,
 )
-print(f"table=bahtflow_raw.transactions status={status}")
+from pipeline.config import load_gcp_settings
 
-status = adapter.ensure_partitioned_table(
-    "bahtflow_raw",
-    "fx_rates",
-    FX_RATES_SCHEMA,
-    FX_RATES_PARTITION_FIELD,
-)
-print(f"table=bahtflow_raw.fx_rates status={status}")
+
+def _partition_field(table) -> str | None:
+    return getattr(table.time_partitioning, "field", None)
+
+
+def main() -> None:
+    settings = load_gcp_settings()
+    adapter = BigQueryAdapter(settings.project_id)
+
+    datasets = [adapter.get_dataset(dataset_id) for dataset_id in DATASET_IDS]
+    for dataset in datasets:
+        if (dataset.location or "").upper() != settings.location.upper():
+            raise BigQueryContractError(
+                f"Dataset location mismatch during verification: {dataset.dataset_id}"
+            )
+
+    transactions = adapter.get_table("bahtflow_raw", "transactions")
+    fx_rates = adapter.get_table("bahtflow_raw", "fx_rates")
+
+    tx_partition = _partition_field(transactions)
+    fx_partition = _partition_field(fx_rates)
+    if tx_partition != TRANSACTIONS_PARTITION_FIELD:
+        raise BigQueryContractError("transactions partition verification failed")
+    if fx_partition != FX_RATES_PARTITION_FIELD:
+        raise BigQueryContractError("fx_rates partition verification failed")
+
+    project = settings.project_id
+    tx_rows = adapter.query_scalar(
+        f"SELECT COUNT(*) FROM `{project}.bahtflow_raw.transactions`"
+    )
+    fx_rows = adapter.query_scalar(
+        f"SELECT COUNT(*) FROM `{project}.bahtflow_raw.fx_rates`"
+    )
+    if tx_rows != 0 or fx_rows != 0:
+        raise BigQueryContractError(
+            f"F03 raw tables must be empty: transactions={tx_rows} fx_rates={fx_rows}"
+        )
+
+    print(f"datasets={len(datasets)}")
+    print("raw_tables=2")
+    print(f"transactions_partition={tx_partition}")
+    print(f"fx_rates_partition={fx_partition}")
+    print(f"transactions_rows={tx_rows}")
+    print(f"fx_rates_rows={fx_rows}")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-Use module execution only:
+- [ ] **Step 3: Add the minimum README commands**
 
-```powershell
-python -m scripts.bootstrap_bigquery
-```
-
-- [ ] **Step 2: Add a read-only live verifier**
-
-Create `scripts/verify_bigquery_live.py`. It must read all four datasets and both raw tables and print exactly these evidence fields:
-
-```text
-datasets=4
-raw_tables=2
-transactions_partition=batch_date
-fx_rates_partition=rate_date
-transactions_rows=0
-fx_rates_rows=0
-```
-
-For row counts, execute two explicit BigQuery queries:
-
-```sql
-SELECT COUNT(*) AS row_count FROM `<project>.bahtflow_raw.transactions`
-SELECT COUNT(*) AS row_count FROM `<project>.bahtflow_raw.fx_rates`
-```
-
-The verifier must fail if dataset count is not 4, raw table count is not 2, partitions differ, or either table is non-empty at F03 acceptance time.
-
-- [ ] **Step 3: Document the minimum GCP setup**
-
-Add a concise F03 README section with these operator commands, using the existing configured project/runtime service account values rather than hardcoded real email addresses:
+Document only these F03 operator actions:
 
 ```powershell
 gcloud services enable bigquery.googleapis.com --project $env:BAHTFLOW_GCP_PROJECT
@@ -410,11 +599,7 @@ gcloud projects add-iam-policy-binding $env:BAHTFLOW_GCP_PROJECT `
 gcloud projects add-iam-policy-binding $env:BAHTFLOW_GCP_PROJECT `
   --member="serviceAccount:$env:BAHTFLOW_RUNTIME_SERVICE_ACCOUNT" `
   --role="roles/bigquery.dataEditor"
-```
 
-Then document:
-
-```powershell
 docker compose --profile gcp build gcp-toolbox
 
 docker compose --profile gcp run --rm gcp-toolbox `
@@ -424,7 +609,7 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.verify_bigquery_live
 ```
 
-State that the second bootstrap run must report `status=verified` for all six resources.
+Also state that the second bootstrap run must report `status=verified` for all four datasets and both raw tables.
 
 - [ ] **Step 4: Run static and credential-free verification**
 
@@ -442,7 +627,7 @@ git diff --check
 git status --short
 ```
 
-Expected: pytest has 0 failures; remaining commands return no errors; status contains only intended uncommitted F03 files before commit.
+Expected: pytest has 0 failures; compile/Compose/diff checks have no errors; status shows only intended uncommitted F03 files before the final commit.
 
 - [ ] **Step 5: Run live bootstrap twice**
 
@@ -453,7 +638,7 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.bootstrap_bigquery
 ```
 
-Expected first-run shape on a new project:
+Required first-run shape on a new project:
 
 ```text
 dataset=bahtflow_raw status=created
@@ -471,7 +656,7 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.bootstrap_bigquery
 ```
 
-Expected:
+Required rerun evidence:
 
 ```text
 dataset=bahtflow_raw status=verified
@@ -500,7 +685,15 @@ transactions_rows=0
 fx_rates_rows=0
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Verify credential hygiene**
+
+```powershell
+git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
+```
+
+Expected: no output.
+
+- [ ] **Step 8: Commit**
 
 ```powershell
 git add scripts/bootstrap_bigquery.py scripts/verify_bigquery_live.py README.md
@@ -524,7 +717,7 @@ pytest = 0 failures
 py_compile = clean
 docker compose config = clean
 git diff --check = clean
-credential files remain untracked
+credential file search = empty
 ```
 
 Do not start F04 until this gate is green. F04 owns GCS discovery, Pandas reads/validation, source metadata, and idempotent BigQuery raw loading.
