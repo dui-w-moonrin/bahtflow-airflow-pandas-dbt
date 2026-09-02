@@ -36,6 +36,20 @@ class BigQueryAdapter:
             )
         return "verified"
 
+    def validate_dataset(self, dataset_id: str, location: str) -> str:
+        full_id = f"{self._project_id}.{dataset_id}"
+        try:
+            existing = self._client.get_dataset(full_id)
+        except NotFound as exc:
+            raise BigQueryContractError(f"Dataset does not exist: {full_id}") from exc
+
+        if (existing.location or "").upper() != location.upper():
+            raise BigQueryContractError(
+                f"Dataset location mismatch for {full_id}: "
+                f"expected={location} actual={existing.location}"
+            )
+        return "verified"
+
     def ensure_partitioned_table(
         self,
         dataset_id: str,
@@ -54,6 +68,32 @@ class BigQueryAdapter:
             )
             self._client.create_table(table)
             return "created"
+
+        if _schema_shape(existing.schema) != _schema_shape(schema):
+            raise BigQueryContractError(f"Table schema mismatch for {full_id}")
+
+        actual_partition = getattr(existing.time_partitioning, "field", None)
+        actual_partition_type = getattr(existing.time_partitioning, "type_", None)
+        if actual_partition != partition_field or actual_partition_type != "DAY":
+            raise BigQueryContractError(
+                f"Table partition mismatch for {full_id}: "
+                f"expected=DAY:{partition_field} "
+                f"actual={actual_partition_type}:{actual_partition}"
+            )
+        return "verified"
+
+    def validate_partitioned_table(
+        self,
+        dataset_id: str,
+        table_id: str,
+        schema,
+        partition_field: str,
+    ) -> str:
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        try:
+            existing = self._client.get_table(full_id)
+        except NotFound as exc:
+            raise BigQueryContractError(f"Table does not exist: {full_id}") from exc
 
         if _schema_shape(existing.schema) != _schema_shape(schema):
             raise BigQueryContractError(f"Table schema mismatch for {full_id}")
