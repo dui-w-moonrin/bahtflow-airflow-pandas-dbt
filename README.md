@@ -6,7 +6,7 @@ BahtFlow is a production-minded batch ELT portfolio project for practising the d
 
 The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A` so later stages can classify and quarantine them instead of silently discarding evidence.
 
-Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently.
+Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently. Feature 04 adds one-date Pandas intake and idempotent raw loading from GCS into those BigQuery raw tables.
 
 Read the [data contract](data/README.md) for the source layout and validation manifest. The current v1 roadmap is in [the Pandas v1 design](docs/superpowers/specs/2026-09-02-pandas-v1-roadmap-design.md).
 
@@ -221,6 +221,23 @@ fx_rates_rows=0
 
 Feature 04 owns GCS discovery, Pandas reads/validation, source metadata, and idempotent BigQuery raw loading. Feature 03 intentionally stops before ingestion.
 
+## Feature 04: Pandas intake + idempotent raw load
+
+Feature 04 loads one logical date from immutable GCS into the existing BigQuery raw tables through Pandas.
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.load_raw_batch --batch-date 2025-07-22
+```
+
+Transaction intake requires exactly five canonical regional files: `bkk`, `central`, `north`, `northeast`, and `south`. Same-day FX is optional; if no published FX file exists for the logical date, the run reports `fx_status=NO_NEW_RATE` rather than failing the transaction batch.
+
+Before Pandas reads a source object, Feature 04 verifies its bytes against GCS custom metadata `bahtflow-source-sha256`. Transaction business fields (`txn`, `dtts`, `amount`, `currency`) are preserved as raw strings, including literal `N/A`, blanks, malformed timestamps, malformed amounts, and lowercase currency values.
+
+Idempotency uses deterministic `source_row_id = SHA256(source_file | source_checksum | source_row_number)`. Existing IDs are queried only for the target BigQuery partition, Pandas anti-filters already loaded rows, and unseen rows are appended with `WRITE_APPEND`. An unchanged rerun must report `tx_inserted_rows=0` and, when same-day FX exists, `fx_inserted_rows=0` while partition row counts remain unchanged.
+
+Feature 04 intentionally does not classify business-quality failures, split accepted/quarantine records, resolve effective FX, or perform currency conversion. Those transformations belong to later v1 features.
+
 ## Development checks
 
 ```powershell
@@ -229,8 +246,11 @@ pytest
 python -m py_compile `
   pipeline/bigquery_contract.py `
   pipeline/bigquery_adapter.py `
+  pipeline/pandas_intake.py `
+  pipeline/raw_load.py `
   scripts/bootstrap_bigquery.py `
-  scripts/verify_bigquery_live.py
+  scripts/verify_bigquery_live.py `
+  scripts/load_raw_batch.py
 
 docker compose config --quiet
 git diff --check
