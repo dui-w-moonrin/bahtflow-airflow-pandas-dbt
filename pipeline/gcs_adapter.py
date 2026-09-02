@@ -59,3 +59,8 @@ class GcsAdapter:
 
     def download_bytes(self, bucket_name: str, object_name: str) -> bytes:
         return self._client.bucket(bucket_name).blob(object_name).download_as_bytes()
+
+    def delete_object(self, bucket_name: str, object_name: str) -> None:
+        blob = self._client.bucket(bucket_name).blob(object_name)
+        blob.reload()
+        blob.delete(if_generation_match=blob.generation)
