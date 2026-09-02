@@ -74,3 +74,30 @@ QUARANTINE_TRANSACTIONS_SCHEMA = (
     bigquery.SchemaField("quarantined_at", "TIMESTAMP", mode="REQUIRED"),
 )
 QUARANTINE_TRANSACTIONS_PARTITION_FIELD = "batch_date"
+
+FACT_DATASET_ID = "bahtflow_analytics"
+FACT_TABLE_ID = "fct_transactions"
+FACT_TRANSACTIONS_SCHEMA = (
+    bigquery.SchemaField("txn", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("transaction_dt", "DATETIME", mode="REQUIRED"),
+    bigquery.SchemaField("amount", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("currency", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("region", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("source_file", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("source_checksum", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("source_row_number", "INTEGER", mode="REQUIRED"),
+    bigquery.SchemaField("source_row_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),
+    bigquery.SchemaField("ingested_at", "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("classified_at", "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("amount_thb", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("amount_usd", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("amount_eur", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("fx_rate_date", "DATE", mode="REQUIRED"),
+    bigquery.SchemaField("usd_thb_rate", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("eur_thb_rate", "NUMERIC", mode="REQUIRED"),
+    bigquery.SchemaField("is_carried_forward", "BOOLEAN", mode="REQUIRED"),
+    bigquery.SchemaField("staleness_days", "INTEGER", mode="REQUIRED"),
+    bigquery.SchemaField("fact_created_at", "TIMESTAMP", mode="REQUIRED"),
+)
+FACT_TRANSACTIONS_PARTITION_FIELD = "batch_date"
