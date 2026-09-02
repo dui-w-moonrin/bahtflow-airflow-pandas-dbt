@@ -2,53 +2,47 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the proven F04-F06 Pandas/GCS/BigQuery services into one Airflow 3 TaskFlow DAG that uses Airflow logical date for both normal execution and explicit serial historical backfill, ending at `bahtflow_analytics.fct_transactions`.
+**Goal:** Turn proven F04-F06 Pandas/GCS/BigQuery services into one Airflow 3 TaskFlow DAG that uses Airflow logical date for normal execution and explicit serial historical backfill, ending at `bahtflow_analytics.fct_transactions`.
 
-**Architecture:** Build a custom Airflow 3.3.1 image with the existing GCP/Pandas dependencies, split F04 raw ingestion into transaction and FX boundaries while preserving `load_raw_batch()`, add read-only preflight, and replace the skeleton DAG with thin TaskFlow wrappers. Durable state stays in BigQuery; XCom contains only ISO batch date and small dataclass summaries converted to dictionaries. Daily scheduling uses `catchup=False`; explicit backfill runs oldest-to-newest with one active run.
+**Architecture:** Build a custom Airflow 3.3.1 image with existing GCP/Pandas dependencies, split F04 raw ingestion into TX and FX boundaries while preserving `load_raw_batch`, add read-only preflight, and replace the skeleton DAG with thin TaskFlow wrappers. Durable data stays in BigQuery; XCom carries only ISO batch date and small JSON-serializable summaries. Daily scheduling uses `catchup=False`; backfill runs oldest-to-newest with one active run.
 
-**Tech Stack:** Python 3.12, Apache Airflow 3.3.1, `airflow.sdk` TaskFlow API, Pandas 2.3.3, google-cloud-storage 3.13.1, google-cloud-bigquery 3.44.0, BigQuery, GCS, Docker Compose, pytest.
+**Tech Stack:** Python 3.12, Apache Airflow 3.3.1, `airflow.sdk`, Pandas 2.3.3, google-cloud-storage 3.13.1, google-cloud-bigquery 3.44.0, BigQuery, GCS, Docker Compose, pytest.
 
 **Spec:** `docs/superpowers/specs/2026-09-02-feat-07-airflow-e2e-backfill-design.md`
 
 ## Global Constraints
 
-- Work on normal branch `feat/07-airflow-e2e-backfill`; do not create or require a worktree.
-- Keep the feature branch after completion; branch cleanup waits until all project features finish.
-- Base Airflow runtime is exactly `apache/airflow:3.3.1-python3.12`.
-- DAG authoring uses Airflow 3 public APIs from `airflow.sdk`: `@dag`, `@task`, `get_current_context`.
-- DAG schedule is `@daily`, `catchup=False`, `max_active_runs=1`.
-- Central retry policy is exactly 2 retries with a 2-minute delay via DAG `default_args`.
-- Airflow logical date converted to `Asia/Bangkok` is the only batch-date source of truth; no DAG batch-date override exists.
-- Missing or timezone-naive logical date fails; never substitute wall-clock time.
-- Explicit F07 backfill runs oldest-to-newest with `--max-active-runs 1`; never use `--run-backwards`.
-- F07 ends at persisted `bahtflow_analytics.fct_transactions`.
-- Marts, publish state, final quality gate, rollback, and persisted run audit are F08 scope.
-- Full 360-date measured execution is F09 scope.
-- Preflight is validate-only; it never creates or alters GCS/BigQuery resources.
-- Missing same-day FX is valid `NO_NEW_RATE`; present malformed FX fails.
-- Effective FX remains F06 behavior: newest complete valid USD/EUR publication with `rate_date <= batch_date`; no future/default FX.
-- No DataFrame, source bytes, accepted rows, quarantine rows, or fact rows go through XCom.
-- Business transformations stay in `pipeline/`; DAG code only orchestrates.
-- Preserve F04-F06 persisted schemas, idempotent source-row anti-filtering, and single-writer semantics.
-- Do not add dbt, Spark/PySpark, Kafka, streaming, Composer, Kubernetes, Terraform, Great Expectations, BI, or ML.
-- Use RED -> GREEN -> REFACTOR. No production code before the corresponding failing test output has been observed.
-- Commit after every independently testable task.
+- Use normal branch `feat/07-airflow-e2e-backfill`; do not require a worktree.
+- Retain the feature branch after integration.
+- Base Airflow image: `apache/airflow:3.3.1-python3.12`.
+- DAG authoring uses `@dag`, `@task`, and `get_current_context` from `airflow.sdk`.
+- DAG schedule: `@daily`, `catchup=False`, `max_active_runs=1`.
+- DAG retry policy: 2 retries, 2-minute delay, configured centrally in `default_args`.
+- Airflow logical date converted to `Asia/Bangkok` is the only batch-date source; no independent DAG batch-date parameter.
+- Missing or timezone-naive logical date fails.
+- Backfill uses `--max-active-runs 1` and never `--run-backwards`.
+- Preflight validates only; it never creates GCS/BigQuery resources.
+- Missing same-day FX is `NO_NEW_RATE`; present malformed FX fails.
+- Effective FX remains newest complete valid USD/EUR snapshot with `rate_date <= batch_date`.
+- No DataFrame, source bytes, accepted rows, quarantine rows, or fact rows through XCom.
+- Business transformations remain in `pipeline/`.
+- Preserve F04-F06 schemas, idempotency, and single-writer behavior.
+- F07 stops at fact. Marts/publish/recovery are F08. Full 360-date measured execution is F09.
+- No dbt, Spark, Kafka, streaming, Composer, Kubernetes, Terraform, Great Expectations, BI, or ML.
+- Use RED -> GREEN -> REFACTOR; observe failing test output before production changes.
+- Commit each independently testable task.
 
----
+## File Map
 
-## File Structure Map
+**Create:**
+- `docker/airflow.Dockerfile`
+- `pipeline/preflight.py`
+- `pipeline/orchestration_date.py`
+- `tests/pipeline/test_preflight.py`
+- `tests/pipeline/test_orchestration_date.py`
+- `tests/airflow/test_airflow_runtime_config.py`
 
-**Create**
-
-- `docker/airflow.Dockerfile` — custom Airflow image with `requirements-gcp.txt`.
-- `pipeline/preflight.py` — read-only runtime/GCS/BigQuery readiness check.
-- `pipeline/orchestration_date.py` — pure logical-date to `batch_date` conversion.
-- `tests/pipeline/test_preflight.py` — preflight unit tests.
-- `tests/pipeline/test_orchestration_date.py` — timezone/source-of-truth tests.
-- `tests/airflow/test_airflow_runtime_config.py` — static Docker/Compose contract tests.
-
-**Modify**
-
+**Modify:**
 - `.env.example`
 - `docker-compose.yml`
 - `airflow/dags/bahtflow_daily.py`
@@ -59,8 +53,7 @@
 - `tests/airflow/test_bahtflow_daily_dag.py`
 - `README.md`
 
-**Do not change unless a reproduced interface defect requires it**
-
+**Keep business semantics unchanged:**
 - `pipeline/transaction_classification.py`
 - `pipeline/classification_load.py`
 - `pipeline/fx_resolution.py`
@@ -69,28 +62,25 @@
 
 ---
 
-### Task 1: Split F04 Raw Loading into TX and FX Services
+### Task 1: Split F04 Raw Load into TX and FX Services
 
 **Files:**
 - Modify: `pipeline/raw_load.py`
 - Modify: `tests/pipeline/test_raw_load.py`
 
 **Interfaces:**
-- Produces `TransactionRawLoadSummary` and `FxRawLoadSummary`.
-- Produces `load_transaction_raw_batch(...) -> TransactionRawLoadSummary`.
-- Produces `load_fx_raw_batch(...) -> FxRawLoadSummary`.
-- Preserves existing `load_raw_batch(...) -> RawLoadSummary`.
+- `TransactionRawLoadSummary`
+- `FxRawLoadSummary`
+- `load_transaction_raw_batch(*, batch_date: date, bucket_name: str, gcs_adapter, bigquery_adapter, ingested_at: datetime | None = None) -> TransactionRawLoadSummary`
+- `load_fx_raw_batch(*, batch_date: date, bucket_name: str, gcs_adapter, bigquery_adapter, ingested_at: datetime | None = None) -> FxRawLoadSummary`
+- Existing `load_raw_batch` remains compatible.
 
-- [ ] **Step 1: Write split-boundary failing tests**
+- [ ] **Step 1: Write RED tests**
 
 Update imports:
 
 ```python
-from pipeline.raw_load import (
-    load_fx_raw_batch,
-    load_raw_batch,
-    load_transaction_raw_batch,
-)
+from pipeline.raw_load import load_fx_raw_batch, load_raw_batch, load_transaction_raw_batch
 ```
 
 Add:
@@ -101,7 +91,6 @@ def test_transaction_raw_loader_does_not_require_same_day_fx():
     objects = _objects_with_fx(d)
     del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
     bq = FakeBigQueryAdapter()
-
     summary = load_transaction_raw_batch(
         batch_date=d,
         bucket_name="bucket",
@@ -109,8 +98,6 @@ def test_transaction_raw_loader_does_not_require_same_day_fx():
         bigquery_adapter=bq,
         ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
     )
-
-    assert summary.batch_date == "2025-07-22"
     assert (summary.tx_files, summary.tx_source_rows) == (5, 5)
     assert (summary.tx_inserted_rows, summary.tx_partition_rows) == (5, 5)
     assert bq.rows[("fx_rates", "2025-07-22")] == []
@@ -121,7 +108,6 @@ def test_fx_raw_loader_returns_no_new_rate_without_touching_transactions():
     objects = _objects_with_fx(d)
     del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
     bq = FakeBigQueryAdapter()
-
     summary = load_fx_raw_batch(
         batch_date=d,
         bucket_name="bucket",
@@ -129,8 +115,6 @@ def test_fx_raw_loader_returns_no_new_rate_without_touching_transactions():
         bigquery_adapter=bq,
         ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
     )
-
-    assert summary.batch_date == "2025-07-22"
     assert summary.fx_status == "NO_NEW_RATE"
     assert (summary.fx_source_rows, summary.fx_inserted_rows, summary.fx_partition_rows) == (0, 0, 0)
     assert bq.rows[("transactions", "2025-07-22")] == []
@@ -155,7 +139,7 @@ def test_combined_raw_loader_remains_backward_compatible_after_split():
 pytest tests/pipeline/test_raw_load.py -q
 ```
 
-Expected: import/collection failure for the two new functions.
+Expected: missing new functions.
 
 - [ ] **Step 3: Add summary dataclasses**
 
@@ -178,13 +162,15 @@ class FxRawLoadSummary:
     fx_partition_rows: int
 ```
 
-Keep `RawLoadSummary` unchanged.
-
-- [ ] **Step 4: Implement transaction-only persistence by extracting current TX code**
+- [ ] **Step 4: Implement TX-only loader**
 
 ```python
 def load_transaction_raw_batch(
-    *, batch_date: date, bucket_name: str, gcs_adapter, bigquery_adapter,
+    *,
+    batch_date: date,
+    bucket_name: str,
+    gcs_adapter,
+    bigquery_adapter,
     ingested_at: datetime | None = None,
 ) -> TransactionRawLoadSummary:
     invocation_time = ingested_at or datetime.now(timezone.utc)
@@ -205,17 +191,23 @@ def load_transaction_raw_batch(
         "bahtflow_raw", "transactions", TRANSACTIONS_PARTITION_FIELD, batch_date
     )
     return TransactionRawLoadSummary(
-        batch_date=batch_date.isoformat(), tx_files=5,
-        tx_source_rows=len(tx_frame), tx_inserted_rows=inserted,
+        batch_date=batch_date.isoformat(),
+        tx_files=5,
+        tx_source_rows=len(tx_frame),
+        tx_inserted_rows=inserted,
         tx_partition_rows=partition_rows,
     )
 ```
 
-- [ ] **Step 5: Implement sparse FX-only persistence by extracting current FX code**
+- [ ] **Step 5: Implement FX-only loader**
 
 ```python
 def load_fx_raw_batch(
-    *, batch_date: date, bucket_name: str, gcs_adapter, bigquery_adapter,
+    *,
+    batch_date: date,
+    bucket_name: str,
+    gcs_adapter,
+    bigquery_adapter,
     ingested_at: datetime | None = None,
 ) -> FxRawLoadSummary:
     invocation_time = ingested_at or datetime.now(timezone.utc)
@@ -238,43 +230,59 @@ def load_fx_raw_batch(
         "bahtflow_raw", "fx_rates", FX_RATES_PARTITION_FIELD, batch_date
     )
     return FxRawLoadSummary(
-        batch_date=batch_date.isoformat(), fx_status=status,
-        fx_source_rows=len(fx_frame), fx_inserted_rows=inserted,
+        batch_date=batch_date.isoformat(),
+        fx_status=status,
+        fx_source_rows=len(fx_frame),
+        fx_inserted_rows=inserted,
         fx_partition_rows=partition_rows,
     )
 ```
 
-- [ ] **Step 6: Rebuild `load_raw_batch()` as a compatibility facade**
-
-Use one shared invocation timestamp, call the two new functions in TX-then-FX order, and return the original `RawLoadSummary` fields:
+- [ ] **Step 6: Rebuild combined compatibility facade explicitly**
 
 ```python
-invocation_time = ingested_at or datetime.now(timezone.utc)
-tx = load_transaction_raw_batch(..., ingested_at=invocation_time)
-fx = load_fx_raw_batch(..., ingested_at=invocation_time)
-return RawLoadSummary(
-    batch_date=batch_date.isoformat(),
-    tx_files=tx.tx_files,
-    tx_source_rows=tx.tx_source_rows,
-    tx_inserted_rows=tx.tx_inserted_rows,
-    tx_partition_rows=tx.tx_partition_rows,
-    fx_status=fx.fx_status,
-    fx_source_rows=fx.fx_source_rows,
-    fx_inserted_rows=fx.fx_inserted_rows,
-    fx_partition_rows=fx.fx_partition_rows,
-)
+def load_raw_batch(
+    *,
+    batch_date: date,
+    bucket_name: str,
+    gcs_adapter,
+    bigquery_adapter,
+    ingested_at: datetime | None = None,
+) -> RawLoadSummary:
+    invocation_time = ingested_at or datetime.now(timezone.utc)
+    tx = load_transaction_raw_batch(
+        batch_date=batch_date,
+        bucket_name=bucket_name,
+        gcs_adapter=gcs_adapter,
+        bigquery_adapter=bigquery_adapter,
+        ingested_at=invocation_time,
+    )
+    fx = load_fx_raw_batch(
+        batch_date=batch_date,
+        bucket_name=bucket_name,
+        gcs_adapter=gcs_adapter,
+        bigquery_adapter=bigquery_adapter,
+        ingested_at=invocation_time,
+    )
+    return RawLoadSummary(
+        batch_date=batch_date.isoformat(),
+        tx_files=tx.tx_files,
+        tx_source_rows=tx.tx_source_rows,
+        tx_inserted_rows=tx.tx_inserted_rows,
+        tx_partition_rows=tx.tx_partition_rows,
+        fx_status=fx.fx_status,
+        fx_source_rows=fx.fx_source_rows,
+        fx_inserted_rows=fx.fx_inserted_rows,
+        fx_partition_rows=fx.fx_partition_rows,
+    )
 ```
 
-The `...` above refers only to the unchanged keyword arguments already present in `load_raw_batch`: `batch_date`, `bucket_name`, `gcs_adapter`, and `bigquery_adapter`; copy those exact values into both calls.
-
-- [ ] **Step 7: GREEN and full regression**
+- [ ] **Step 7: GREEN + regression**
 
 ```powershell
 pytest tests/pipeline/test_raw_load.py -q
 pytest -q
 ```
-
-Expected: all pass.
 
 - [ ] **Step 8: Commit**
 
@@ -294,13 +302,12 @@ git commit -m "refactor: split transaction and fx raw loading"
 - Create: `tests/pipeline/test_preflight.py`
 
 **Interfaces:**
-- Produces `validate_dataset(dataset_id, location) -> "verified"`.
-- Produces `validate_partitioned_table(dataset_id, table_id, schema, partition_field) -> "verified"`.
-- Produces `PreflightSummary` and `run_preflight(...)`.
+- `validate_dataset(dataset_id: str, location: str) -> str`
+- `validate_partitioned_table(dataset_id: str, table_id: str, schema, partition_field: str) -> str`
+- `PreflightSummary`
+- `run_preflight(*, settings, gcs_adapter, bigquery_adapter) -> PreflightSummary`
 
-- [ ] **Step 1: Add exact adapter RED tests using the repository's existing `FakeClient`**
-
-Add to `tests/pipeline/test_bigquery_adapter.py`:
+- [ ] **Step 1: Add adapter RED tests using existing `FakeClient`**
 
 ```python
 def test_validate_dataset_returns_verified_for_existing_match():
@@ -325,7 +332,8 @@ def test_validate_partitioned_table_returns_verified_for_existing_match():
     schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
     table = bigquery.Table("proj.bahtflow_raw.transactions", schema=list(schema))
     table.time_partitioning = bigquery.TimePartitioning(
-        type_=bigquery.TimePartitioningType.DAY, field="batch_date"
+        type_=bigquery.TimePartitioningType.DAY,
+        field="batch_date",
     )
     client.tables["proj.bahtflow_raw.transactions"] = table
     adapter = BigQueryAdapter("proj", client=client)
@@ -345,17 +353,13 @@ def test_validate_partitioned_table_missing_fails_without_creation():
     assert client.tables == {}
 ```
 
-Existing ensure-method drift tests already cover location/schema/partition comparison shapes; the new validation methods must use the same comparisons.
-
 - [ ] **Step 2: Observe RED**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py -q
 ```
 
-Expected: missing-method failures.
-
-- [ ] **Step 3: Implement `validate_dataset()` without a create path**
+- [ ] **Step 3: Implement read-only methods**
 
 ```python
 def validate_dataset(self, dataset_id: str, location: str) -> str:
@@ -369,11 +373,8 @@ def validate_dataset(self, dataset_id: str, location: str) -> str:
             f"Dataset location mismatch for {full_id}: expected={location} actual={existing.location}"
         )
     return "verified"
-```
 
-- [ ] **Step 4: Implement `validate_partitioned_table()` without a create path**
 
-```python
 def validate_partitioned_table(self, dataset_id, table_id, schema, partition_field) -> str:
     full_id = f"{self._project_id}.{dataset_id}.{table_id}"
     try:
@@ -391,13 +392,13 @@ def validate_partitioned_table(self, dataset_id, table_id, schema, partition_fie
     return "verified"
 ```
 
-- [ ] **Step 5: GREEN adapter tests**
+- [ ] **Step 4: GREEN adapter tests**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py -q
 ```
 
-- [ ] **Step 6: Write preflight RED test**
+- [ ] **Step 5: Write preflight RED test**
 
 Create `tests/pipeline/test_preflight.py`:
 
@@ -426,15 +427,16 @@ class FakeBigQuery:
         return "verified"
 
 
-def test_preflight_is_validate_only_and_checks_all_f04_f06_resources():
+def test_preflight_is_validate_only_and_checks_f04_f06_resources():
     settings = GcpSettings(
-        project_id="proj", bucket_name="bucket", location="asia-southeast1",
+        project_id="proj",
+        bucket_name="bucket",
+        location="asia-southeast1",
         runtime_service_account="runtime@proj.iam.gserviceaccount.com",
     )
     gcs = FakeGcs()
     bq = FakeBigQuery()
     summary = run_preflight(settings=settings, gcs_adapter=gcs, bigquery_adapter=bq)
-
     assert gcs.calls == [("bucket", "asia-southeast1", False)]
     assert {d for d, _ in bq.datasets} == {"bahtflow_raw", "bahtflow_ops", "bahtflow_analytics"}
     assert set(bq.tables) == {
@@ -448,17 +450,15 @@ def test_preflight_is_validate_only_and_checks_all_f04_f06_resources():
     assert summary.tables_verified == 5
 ```
 
-- [ ] **Step 7: Observe RED**
+- [ ] **Step 6: Observe RED**
 
 ```powershell
 pytest tests/pipeline/test_preflight.py -q
 ```
 
-Expected: missing module.
+- [ ] **Step 7: Implement preflight**
 
-- [ ] **Step 8: Implement preflight**
-
-Create `pipeline/preflight.py` with:
+Create `pipeline/preflight.py`:
 
 ```python
 from dataclasses import dataclass
@@ -499,40 +499,32 @@ def run_preflight(*, settings, gcs_adapter, bigquery_adapter) -> PreflightSummar
     for dataset_id, table_id, schema, partition_field in _REQUIRED_TABLES:
         bigquery_adapter.validate_partitioned_table(dataset_id, table_id, schema, partition_field)
     return PreflightSummary(
-        project_id=settings.project_id, bucket_name=settings.bucket_name,
-        location=settings.location, datasets_verified=3, tables_verified=5,
+        project_id=settings.project_id,
+        bucket_name=settings.bucket_name,
+        location=settings.location,
+        datasets_verified=len(_REQUIRED_DATASETS),
+        tables_verified=len(_REQUIRED_TABLES),
     )
 ```
 
-- [ ] **Step 9: GREEN + regression**
+- [ ] **Step 8: GREEN + regression + commit**
 
 ```powershell
 pytest tests/pipeline/test_preflight.py tests/pipeline/test_bigquery_adapter.py -q
 pytest -q
-```
-
-- [ ] **Step 10: Commit**
-
-```powershell
 git add pipeline/bigquery_adapter.py pipeline/preflight.py tests/pipeline/test_bigquery_adapter.py tests/pipeline/test_preflight.py
 git commit -m "feat: add read-only pipeline preflight"
 ```
 
 ---
 
-### Task 3: Build the Custom Airflow Runtime
+### Task 3: Build Custom Airflow Runtime
 
 **Files:**
 - Create: `docker/airflow.Dockerfile`
 - Modify: `docker-compose.yml`
 - Modify: `.env.example`
 - Create: `tests/airflow/test_airflow_runtime_config.py`
-
-**Interfaces:**
-- Default custom tag: `bahtflow-airflow:3.3.1`.
-- Repository path: `/opt/bahtflow`.
-- ADC path: `/var/secrets/google/application_default_credentials.json`, read-only.
-- DAG folder: `/opt/bahtflow/airflow/dags`.
 
 - [ ] **Step 1: Write static RED tests**
 
@@ -584,8 +576,6 @@ def test_env_example_uses_custom_image_variable():
 pytest tests/airflow/test_airflow_runtime_config.py -q
 ```
 
-Expected: Dockerfile missing and Compose contract mismatch.
-
 - [ ] **Step 3: Create Dockerfile**
 
 ```dockerfile
@@ -595,7 +585,7 @@ COPY requirements-gcp.txt /tmp/requirements-gcp.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-gcp.txt
 ```
 
-- [ ] **Step 4: Update Compose common Airflow block**
+- [ ] **Step 4: Update Compose Airflow common block**
 
 Use:
 
@@ -606,7 +596,7 @@ Use:
   image: ${BAHTFLOW_AIRFLOW_IMAGE_NAME:-bahtflow-airflow:3.3.1}
 ```
 
-Add to `&airflow-common-env`:
+Add to common environment:
 
 ```yaml
     AIRFLOW__CORE__DAGS_FOLDER: /opt/bahtflow/airflow/dags
@@ -630,31 +620,31 @@ Use common volumes:
       read_only: true
 ```
 
-Remove the old DAG-only mount because the full repository mount already exposes the DAG folder.
+Remove old DAG-only mount.
 
 - [ ] **Step 5: Update `.env.example`**
 
-Replace the old `AIRFLOW_IMAGE_NAME=...` line with:
+Replace old Airflow image line with:
 
 ```text
 BAHTFLOW_AIRFLOW_IMAGE_NAME=bahtflow-airflow:3.3.1
 ```
 
-- [ ] **Step 6: GREEN static contract and Compose config**
+- [ ] **Step 6: GREEN static/runtime config**
 
 ```powershell
 pytest tests/airflow/test_airflow_runtime_config.py -q
 docker compose config --quiet
 ```
 
-- [ ] **Step 7: Build image and prove imports**
+- [ ] **Step 7: Build and prove imports**
 
 ```powershell
 docker compose build airflow-api-server airflow-scheduler airflow-dag-processor
 docker compose run --rm airflow-scheduler python -c "import pandas; import google.cloud.bigquery; import google.cloud.storage; import pipeline; print('airflow_pipeline_import_ok')"
 ```
 
-Expected final line: `airflow_pipeline_import_ok`.
+Expected: `airflow_pipeline_import_ok`.
 
 - [ ] **Step 8: Full regression and commit**
 
@@ -666,7 +656,7 @@ git commit -m "build: add custom Airflow pipeline runtime"
 
 ---
 
-### Task 4: Add Logical-Date Conversion and Production TaskFlow DAG
+### Task 4: Add Logical-Date Helper and Production TaskFlow DAG
 
 **Files:**
 - Create: `pipeline/orchestration_date.py`
@@ -674,11 +664,7 @@ git commit -m "build: add custom Airflow pipeline runtime"
 - Modify: `airflow/dags/bahtflow_daily.py`
 - Modify: `tests/airflow/test_bahtflow_daily_dag.py`
 
-**Interfaces:**
-- Produces `batch_date_from_logical_date(logical_date: datetime | None) -> date`.
-- Exact task IDs: `resolve_batch_date`, `preflight`, `load_tx_raw`, `load_fx_raw`, `classify_transactions`, `build_currency_fact`, `finish`.
-
-- [ ] **Step 1: Write pure logical-date RED tests**
+- [ ] **Step 1: Write logical-date RED tests**
 
 ```python
 from datetime import datetime, timezone
@@ -731,9 +717,7 @@ def batch_date_from_logical_date(logical_date: datetime | None) -> date:
 pytest tests/pipeline/test_orchestration_date.py -q
 ```
 
-- [ ] **Step 5: Replace skeleton DAG tests with TaskFlow RED contract**
-
-Rewrite `tests/airflow/test_bahtflow_daily_dag.py` as host-side source inspection:
+- [ ] **Step 5: Replace old DAG tests with TaskFlow RED contract**
 
 ```python
 from pathlib import Path
@@ -770,7 +754,7 @@ def test_dag_has_exact_f07_task_ids():
         assert f'task_id="{task_id}"' in s
 
 
-def test_dag_uses_pipeline_services_and_no_dataframe_business_logic():
+def test_dag_uses_pipeline_services_without_dataframe_business_logic():
     s = _source()
     for symbol in (
         "load_transaction_raw_batch", "load_fx_raw_batch",
@@ -795,11 +779,9 @@ def test_dependency_edges_match_f07():
 pytest tests/airflow/test_bahtflow_daily_dag.py -q
 ```
 
-Expected: old EmptyOperator/dbt skeleton fails the new contract.
-
 - [ ] **Step 7: Implement TaskFlow DAG**
 
-Use imports:
+Imports:
 
 ```python
 from __future__ import annotations
@@ -834,19 +816,14 @@ DAG declaration:
 def bahtflow_daily():
 ```
 
-Resolve logical date once:
+Task bodies:
 
 ```python
     @task(task_id="resolve_batch_date")
     def resolve_batch_date() -> str:
         context = get_current_context()
-        logical_date = context["dag_run"].logical_date
-        return batch_date_from_logical_date(logical_date).isoformat()
-```
+        return batch_date_from_logical_date(context["dag_run"].logical_date).isoformat()
 
-Preflight wrapper:
-
-```python
     @task(task_id="preflight")
     def preflight(batch_date: str) -> dict:
         date.fromisoformat(batch_date)
@@ -856,19 +833,14 @@ Preflight wrapper:
             gcs_adapter=GcsAdapter(settings.project_id),
             bigquery_adapter=BigQueryAdapter(settings.project_id),
         ))
-```
 
-TX/FX wrappers create fresh GCS/BQ adapters and call the Task 1 functions; classification/fact wrappers create fresh BQ adapters and call the unchanged F05/F06 persistence services. Every wrapper receives the ISO batch-date string, converts with `date.fromisoformat`, and returns `asdict(summary)`.
-
-Use these exact function bodies for the remaining four wrappers:
-
-```python
     @task(task_id="load_tx_raw")
     def load_tx_raw(batch_date: str) -> dict:
         d = date.fromisoformat(batch_date)
         settings = load_gcp_settings()
         return asdict(load_transaction_raw_batch(
-            batch_date=d, bucket_name=settings.bucket_name,
+            batch_date=d,
+            bucket_name=settings.bucket_name,
             gcs_adapter=GcsAdapter(settings.project_id),
             bigquery_adapter=BigQueryAdapter(settings.project_id),
         ))
@@ -878,7 +850,8 @@ Use these exact function bodies for the remaining four wrappers:
         d = date.fromisoformat(batch_date)
         settings = load_gcp_settings()
         return asdict(load_fx_raw_batch(
-            batch_date=d, bucket_name=settings.bucket_name,
+            batch_date=d,
+            bucket_name=settings.bucket_name,
             gcs_adapter=GcsAdapter(settings.project_id),
             bigquery_adapter=BigQueryAdapter(settings.project_id),
         ))
@@ -888,7 +861,8 @@ Use these exact function bodies for the remaining four wrappers:
         d = date.fromisoformat(batch_date)
         settings = load_gcp_settings()
         return asdict(classify_and_load_batch(
-            batch_date=d, bigquery_adapter=BigQueryAdapter(settings.project_id)
+            batch_date=d,
+            bigquery_adapter=BigQueryAdapter(settings.project_id),
         ))
 
     @task(task_id="build_currency_fact")
@@ -896,11 +870,12 @@ Use these exact function bodies for the remaining four wrappers:
         d = date.fromisoformat(batch_date)
         settings = load_gcp_settings()
         return asdict(build_and_load_currency_fact(
-            batch_date=d, bigquery_adapter=BigQueryAdapter(settings.project_id)
+            batch_date=d,
+            bigquery_adapter=BigQueryAdapter(settings.project_id),
         ))
 ```
 
-Wire exactly:
+Dependency wiring:
 
 ```python
     batch_date = resolve_batch_date()
@@ -927,14 +902,14 @@ pytest tests/pipeline/test_orchestration_date.py tests/airflow/test_bahtflow_dai
 pytest -q
 ```
 
-- [ ] **Step 9: Prove real Airflow import in custom image**
+- [ ] **Step 9: Prove real runtime import**
 
 ```powershell
 docker compose run --rm airflow-scheduler python -c "import importlib.util; p='/opt/bahtflow/airflow/dags/bahtflow_daily.py'; s=importlib.util.spec_from_file_location('bahtflow_daily', p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('dag_import_ok')"
 docker compose run --rm airflow-scheduler airflow dags list | Select-String bahtflow_daily
 ```
 
-Expected: `dag_import_ok` and one `bahtflow_daily` entry.
+Expected: `dag_import_ok` and `bahtflow_daily` listed.
 
 - [ ] **Step 10: Commit**
 
@@ -948,9 +923,9 @@ git commit -m "feat: orchestrate daily pipeline with Airflow TaskFlow"
 ### Task 5: Prove One-Day Airflow E2E and Idempotency
 
 **Files:**
-- Modify only after execution: `README.md`
+- Modify after execution: `README.md`
 
-**Acceptance logical date:** `2025-07-22`.
+**Logical date:** `2025-07-22`.
 
 - [ ] **Step 1: Start custom Airflow services**
 
@@ -964,7 +939,7 @@ docker compose ps
 
 Expected: Postgres/API healthy; scheduler and DAG processor running.
 
-- [ ] **Step 2: Run read-only preflight inside the same Airflow runtime**
+- [ ] **Step 2: Run read-only preflight inside Airflow image**
 
 ```powershell
 @'
@@ -990,11 +965,9 @@ docker compose exec airflow-scheduler airflow dags list | Select-String bahtflow
 docker compose exec airflow-scheduler airflow dags list-import-errors
 ```
 
-Expected: DAG listed; no import error for `bahtflow_daily.py`.
+Expected: DAG listed and no import error for its file.
 
-- [ ] **Step 4: Run one explicit logical date through Airflow**
-
-Use single-date backfill to guarantee a non-null historical logical date:
+- [ ] **Step 4: Run explicit one-date backfill**
 
 ```powershell
 docker compose exec airflow-scheduler airflow backfill create --dag-id bahtflow_daily --from-date 2025-07-22 --to-date 2025-07-22 --reprocess-behavior completed --max-active-runs 1
@@ -1002,9 +975,9 @@ docker compose exec airflow-scheduler airflow backfill create --dag-id bahtflow_
 
 Do not use `--run-backwards`.
 
-- [ ] **Step 5: Inspect all task states and summaries**
+- [ ] **Step 5: Inspect task states and summaries**
 
-Confirm these tasks succeed:
+Required successful tasks:
 
 ```text
 resolve_batch_date
@@ -1016,7 +989,7 @@ build_currency_fact
 finish
 ```
 
-Because `2025-07-22` was already fully persisted in F04-F06, expected inserted metrics are zero while reconciliations stay true:
+Because F04-F06 already persisted this date, verify:
 
 ```text
 tx_inserted_rows=0
@@ -1028,11 +1001,11 @@ classification reconciled=True
 fact reconciled=True
 ```
 
-- [ ] **Step 6: Run the same one-date Airflow command again**
+- [ ] **Step 6: Repeat Step 4**
 
-Repeat Step 4. Expected persisted inserted metrics remain zero.
+Expected: persisted inserted counts remain zero.
 
-- [ ] **Step 7: Query direct BigQuery baseline dynamically using configured project**
+- [ ] **Step 7: Query persisted baseline dynamically**
 
 ```powershell
 @'
@@ -1061,11 +1034,11 @@ quarantine=175
 fact=8803
 ```
 
-- [ ] **Step 8: Document only executed one-day evidence**
+- [ ] **Step 8: Document executed one-day evidence only**
 
-Add to `README.md`: custom runtime, logical-date-only rule, command used, actual DAG state, actual inserted metrics, actual partition counts, and second-run zero-insert evidence. Do not add weekend evidence before Task 6.
+README records custom runtime, logical-date rule, exact command, actual task/run state, inserted metrics, partition counts, and second-run zero-insert evidence.
 
-- [ ] **Step 9: Verify and commit evidence**
+- [ ] **Step 9: Verify and commit**
 
 ```powershell
 pytest -q
@@ -1077,20 +1050,20 @@ git commit -m "docs: add Airflow one-day E2E evidence"
 
 ---
 
-### Task 6: Prove Forward Serial Backfill and Live FX Carry-Forward
+### Task 6: Prove Forward Serial Backfill and Live Carry-Forward
 
 **Files:**
-- Modify only after execution: `README.md`
+- Modify after execution: `README.md`
 
-**Acceptance window:** `2025-07-25` through `2025-07-27`.
+**Window:** `2025-07-25` through `2025-07-27`.
 
-- [ ] **Step 1: Dry-run chronological dates**
+- [ ] **Step 1: Dry run in chronological order**
 
 ```powershell
 docker compose exec airflow-scheduler airflow backfill create --dag-id bahtflow_daily --from-date 2025-07-25 --to-date 2025-07-27 --reprocess-behavior completed --max-active-runs 1 --dry-run
 ```
 
-Expected order: `2025-07-25`, `2025-07-26`, `2025-07-27`. Do not use `--run-backwards`.
+Verify order `2025-07-25`, `2025-07-26`, `2025-07-27`. Do not use `--run-backwards`.
 
 - [ ] **Step 2: Execute real serial backfill**
 
@@ -1098,11 +1071,9 @@ Expected order: `2025-07-25`, `2025-07-26`, `2025-07-27`. Do not use `--run-back
 docker compose exec airflow-scheduler airflow backfill create --dag-id bahtflow_daily --from-date 2025-07-25 --to-date 2025-07-27 --reprocess-behavior completed --max-active-runs 1
 ```
 
-Expected: three successful runs, one active run at a time.
+- [ ] **Step 3: Capture FX task summaries**
 
-- [ ] **Step 3: Capture FX ingestion task summaries**
-
-Expected source behavior to verify from logs:
+Verify actual source behavior:
 
 ```text
 2025-07-25 -> LOADED
@@ -1110,9 +1081,9 @@ Expected source behavior to verify from logs:
 2025-07-27 -> NO_NEW_RATE
 ```
 
-If actual source data contradicts this, stop and inspect source objects before changing acceptance dates; do not fabricate evidence.
+If source data contradicts this window, stop and inspect source objects before changing acceptance dates.
 
-- [ ] **Step 4: Query persisted carry-forward lineage**
+- [ ] **Step 4: Query carry-forward lineage**
 
 ```powershell
 @'
@@ -1133,17 +1104,17 @@ for row in c.query(sql).result():
 '@ | docker compose run --rm -T airflow-scheduler python -
 ```
 
-Required lineage:
+Required:
 
 ```text
 2025-07-25 -> fx_rate_date=2025-07-25, carried=False, staleness=0
-2025-07-26 -> fx_rate_date=2025-07-25, carried=True,  staleness=1
-2025-07-27 -> fx_rate_date=2025-07-25, carried=True,  staleness=2
+2025-07-26 -> fx_rate_date=2025-07-25, carried=True, staleness=1
+2025-07-27 -> fx_rate_date=2025-07-25, carried=True, staleness=2
 ```
 
-Also require `fact_rows == distinct_source_rows` for each date.
+Require `fact_rows == distinct_source_rows` each date.
 
-- [ ] **Step 5: Prove accepted/fact reconciliation**
+- [ ] **Step 5: Query accepted/fact reconciliation**
 
 ```powershell
 @'
@@ -1172,17 +1143,17 @@ for row in c.query(sql).result():
 '@ | docker compose run --rm -T airflow-scheduler python -
 ```
 
-Expected: three rows with `reconciled=True`.
+Expected: 3 rows, all `reconciled=True`.
 
-- [ ] **Step 6: Re-run identical backfill for idempotency**
+- [ ] **Step 6: Re-run Step 2 for idempotency**
 
-Repeat Step 2. Confirm all TX/FX/accepted/quarantine/fact inserted counts are zero on the completed replay, and both reconciliation summaries are true.
+Verify TX, FX, accepted, quarantine, and fact inserted counts are zero on replay; both reconciliation summaries remain true.
 
-- [ ] **Step 7: Document only executed backfill evidence**
+- [ ] **Step 7: Document executed historical evidence**
 
-Add exact command, forward order, `max_active_runs=1`, FX task statuses, actual `fx_rate_date`, carry flags/staleness, actual fact counts, reconciliation, and second-run zero-insert evidence to README. Explicitly state the 360-day run remains F09.
+README records exact command, forward order, concurrency 1, FX statuses, actual FX lineage/staleness, fact counts, reconciliation, and replay zero-insert evidence. State full 360-day execution remains F09.
 
-- [ ] **Step 8: Verify and commit evidence**
+- [ ] **Step 8: Verify and commit**
 
 ```powershell
 pytest -q
@@ -1214,7 +1185,7 @@ python -m py_compile pipeline/raw_load.py pipeline/bigquery_adapter.py pipeline/
 
 Expected: no output.
 
-- [ ] **Step 3: Validate/rebuild runtime**
+- [ ] **Step 3: Validate and rebuild runtime**
 
 ```powershell
 docker compose config --quiet
@@ -1228,7 +1199,7 @@ docker compose run --rm airflow-scheduler airflow dags list | Select-String baht
 docker compose run --rm airflow-scheduler airflow dags list-import-errors
 ```
 
-Expected: DAG listed; no F07 import error.
+Expected: DAG listed; no import error.
 
 - [ ] **Step 5: Repository clean gates**
 
@@ -1239,8 +1210,6 @@ git diff --check main...feat/07-airflow-e2e-backfill
 git diff --stat main...feat/07-airflow-e2e-backfill
 ```
 
-Expected: no whitespace errors; committed working tree clean.
-
 - [ ] **Step 6: Tracked credential scan**
 
 ```powershell
@@ -1248,7 +1217,7 @@ $patterns = 'private_key|client_secret|ya29\.|-----BEGIN PRIVATE KEY-----'
 git grep -n -I -E $patterns -- . ':!docs/superpowers/plans/*' ':!docs/superpowers/specs/*'
 ```
 
-Inspect any hit. No ADC JSON/private key/token value may be newly tracked.
+Inspect every hit; no credential value may be newly tracked.
 
 - [ ] **Step 7: Scope diff review**
 
@@ -1257,32 +1226,32 @@ git diff --name-status main...feat/07-airflow-e2e-backfill
 git log --oneline main..feat/07-airflow-e2e-backfill
 ```
 
-Review against this exact checklist:
+Verify:
 
 ```text
 custom Airflow image
 GCP/Pandas runtime imports
 repo + ADC read-only wiring
 preflight validate-only
-TX/FX raw split
+TX/FX split
 load_raw_batch compatibility
 logical-date-only batch date
-2 retries / 2-minute central delay
+2 retries / 2-minute delay
 TaskFlow thin wrappers
 catchup=False / max_active_runs=1
 no DataFrame XCom
-single-date and historical same DAG
+same DAG for single-date and historical execution
 oldest-to-newest backfill
-live weekend carry-forward evidence
+live carry-forward evidence
 F07 stops at fact
 no marts/publish/full-360 scope creep
 ```
 
 - [ ] **Step 8: Request code review**
 
-Invoke `superpowers:requesting-code-review`. If the harness cannot dispatch subagents, review the GitHub branch/diff directly and state that limitation. Resolve Critical/Important findings only after reproducing them and applying TDD.
+Invoke `superpowers:requesting-code-review`. If the harness cannot dispatch subagents, review the GitHub diff directly and state that limitation. Resolve Critical/Important findings only after reproducing them and applying TDD.
 
-- [ ] **Step 9: Re-run fresh gates after any review change**
+- [ ] **Step 9: Fresh verification after any review change**
 
 If any file changes after Step 1, rerun:
 
@@ -1296,4 +1265,4 @@ git status --short
 
 - [ ] **Step 10: Finish branch and retain it**
 
-Invoke `superpowers:finishing-a-development-branch`, present its standard integration menu, and retain `feat/07-airflow-e2e-backfill` even if local merge to `main` is chosen.
+Invoke `superpowers:finishing-a-development-branch`, present its standard integration menu, and retain `feat/07-airflow-e2e-backfill` after integration.
