@@ -6,7 +6,11 @@ from datetime import date, datetime, timezone
 
 from pipeline.gcs_adapter import ObjectMetadata
 from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY
-from pipeline.raw_load import load_raw_batch
+from pipeline.raw_load import (
+    load_fx_raw_batch,
+    load_raw_batch,
+    load_transaction_raw_batch,
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -137,3 +141,69 @@ def test_missing_same_day_fx_returns_no_new_rate():
     assert summary.fx_source_rows == 0
     assert summary.fx_inserted_rows == 0
     assert summary.fx_partition_rows == 0
+
+
+def test_transaction_raw_loader_does_not_require_same_day_fx():
+    d = date(2025, 7, 22)
+    objects = _objects_with_fx(d)
+    del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
+    bq = FakeBigQueryAdapter()
+
+    summary = load_transaction_raw_batch(
+        batch_date=d,
+        bucket_name="bucket",
+        gcs_adapter=FakeGcsAdapter(objects),
+        bigquery_adapter=bq,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary.batch_date == "2025-07-22"
+    assert summary.tx_files == 5
+    assert summary.tx_source_rows == 5
+    assert summary.tx_inserted_rows == 5
+    assert summary.tx_partition_rows == 5
+    assert bq.rows[("fx_rates", "2025-07-22")] == []
+
+
+def test_fx_raw_loader_returns_no_new_rate_without_touching_transactions():
+    d = date(2025, 7, 22)
+    objects = _objects_with_fx(d)
+    del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
+    bq = FakeBigQueryAdapter()
+
+    summary = load_fx_raw_batch(
+        batch_date=d,
+        bucket_name="bucket",
+        gcs_adapter=FakeGcsAdapter(objects),
+        bigquery_adapter=bq,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary.batch_date == "2025-07-22"
+    assert summary.fx_status == "NO_NEW_RATE"
+    assert summary.fx_source_rows == 0
+    assert summary.fx_inserted_rows == 0
+    assert summary.fx_partition_rows == 0
+    assert bq.rows[("transactions", "2025-07-22")] == []
+
+
+def test_combined_raw_loader_remains_backward_compatible_after_split():
+    d = date(2025, 7, 22)
+    bq = FakeBigQueryAdapter()
+
+    summary = load_raw_batch(
+        batch_date=d,
+        bucket_name="bucket",
+        gcs_adapter=FakeGcsAdapter(_objects_with_fx(d)),
+        bigquery_adapter=bq,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary.tx_files == 5
+    assert summary.tx_source_rows == 5
+    assert summary.tx_inserted_rows == 5
+    assert summary.tx_partition_rows == 5
+    assert summary.fx_status == "LOADED"
+    assert summary.fx_source_rows == 2
+    assert summary.fx_inserted_rows == 2
+    assert summary.fx_partition_rows == 2
