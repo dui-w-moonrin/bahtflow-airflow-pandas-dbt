@@ -202,3 +202,65 @@ def test_exact_replay_accepts_lowest_source_lineage():
         ["DUPLICATE_REPLAY"],
         ["DUPLICATE_REPLAY"],
     ]
+
+
+def test_conflicting_payloads_quarantine_all_base_valid_occurrences():
+    frame = pd.DataFrame(
+        [
+            raw_row(
+                txn="TX-C",
+                amount="100.00",
+                source_row_id="conflict-a",
+                source_row_number=20,
+            ),
+            raw_row(
+                txn=" TX-C ",
+                amount="101.00",
+                source_row_id="conflict-b",
+                source_row_number=21,
+            ),
+        ]
+    )
+
+    result = classify_transactions(
+        frame,
+        date(2025, 7, 22),
+        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.accepted.empty
+    quarantine = result.quarantine.sort_values("source_row_id").reset_index(drop=True)
+    assert quarantine["source_row_id"].tolist() == ["conflict-a", "conflict-b"]
+    assert quarantine["reason_codes"].tolist() == [
+        ["DUPLICATE_CONFLICT"],
+        ["DUPLICATE_CONFLICT"],
+    ]
+
+
+def test_base_invalid_row_does_not_poison_valid_duplicate_candidate():
+    frame = pd.DataFrame(
+        [
+            raw_row(
+                txn="TX-M",
+                amount="N/A",
+                source_row_id="malformed",
+                source_row_number=30,
+            ),
+            raw_row(
+                txn=" TX-M ",
+                amount="100.00",
+                source_row_id="valid",
+                source_row_number=31,
+            ),
+        ]
+    )
+
+    result = classify_transactions(
+        frame,
+        date(2025, 7, 22),
+        datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.accepted["source_row_id"].tolist() == ["valid"]
+    assert result.quarantine["source_row_id"].tolist() == ["malformed"]
+    assert result.quarantine["reason_codes"].tolist() == [["INVALID_AMOUNT"]]
