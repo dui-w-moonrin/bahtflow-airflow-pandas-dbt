@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 
 import pytest
 
+import pipeline.classification_load as classification_load
 from pipeline.classification_load import classify_and_load_batch
 
 
@@ -154,3 +155,41 @@ def test_first_run_classifies_and_rerun_inserts_zero(raw_rows_fixture):
     assert (second.accepted_inserted_rows, second.quarantine_inserted_rows) == (0, 0)
     assert (second.accepted_partition_rows, second.quarantine_partition_rows) == (2, 2)
     assert second.reconciled is True
+
+
+class MismatchedCountFake(StatefulBigQueryFake):
+    def query_partition_row_count(
+        self,
+        dataset_id,
+        table_id,
+        partition_field,
+        partition_date,
+    ):
+        count = super().query_partition_row_count(
+            dataset_id,
+            table_id,
+            partition_field,
+            partition_date,
+        )
+        if (dataset_id, table_id) == (
+            "bahtflow_analytics",
+            "transactions_accepted",
+        ):
+            return count + 1
+        return count
+
+
+def test_persisted_reconciliation_mismatch_fails(raw_rows_fixture):
+    fake = MismatchedCountFake(raw_rows_fixture)
+
+    try:
+        classify_and_load_batch(
+            batch_date=date(2025, 7, 22),
+            bigquery_adapter=fake,
+            classified_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        )
+    except Exception as exc:
+        assert isinstance(exc, classification_load.ClassificationLoadError)
+        assert "Persisted classification reconciliation failed" in str(exc)
+    else:
+        pytest.fail("Persisted reconciliation mismatch did not fail the run")
