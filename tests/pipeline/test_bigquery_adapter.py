@@ -143,6 +143,23 @@ def test_existing_table_partition_drift_fails():
         )
 
 
+def test_existing_table_partition_type_drift_fails():
+    client = FakeClient()
+    schema = (bigquery.SchemaField("batch_date", "DATE", mode="REQUIRED"),)
+    table = bigquery.Table("proj.bahtflow_raw.transactions", schema=list(schema))
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.MONTH,
+        field="batch_date",
+    )
+    client.tables["proj.bahtflow_raw.transactions"] = table
+    adapter = BigQueryAdapter("proj", client=client)
+
+    with pytest.raises(BigQueryContractError, match="Table partition mismatch"):
+        adapter.ensure_partitioned_table(
+            "bahtflow_raw", "transactions", schema, "batch_date"
+        )
+
+
 def test_query_scalar_returns_first_value_as_int():
     client = FakeClient()
     client.query_value = 17
