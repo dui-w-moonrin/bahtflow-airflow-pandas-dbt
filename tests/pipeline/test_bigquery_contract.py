@@ -94,3 +94,39 @@ def test_quarantine_transactions_contract_is_exact():
         ("quarantined_at", "TIMESTAMP", "REQUIRED"),
     ]
     assert QUARANTINE_TRANSACTIONS_PARTITION_FIELD == "batch_date"
+
+
+def test_currency_fact_contract_is_exact():
+    from pipeline.bigquery_contract import (
+        FACT_DATASET_ID,
+        FACT_TABLE_ID,
+        FACT_TRANSACTIONS_PARTITION_FIELD,
+        FACT_TRANSACTIONS_SCHEMA,
+    )
+
+    assert FACT_DATASET_ID == "bahtflow_analytics"
+    assert FACT_TABLE_ID == "fct_transactions"
+    assert FACT_TRANSACTIONS_PARTITION_FIELD == "batch_date"
+    assert _shape(FACT_TRANSACTIONS_SCHEMA) == [
+        ("txn", "STRING", "REQUIRED"),
+        ("transaction_dt", "DATETIME", "REQUIRED"),
+        ("amount", "NUMERIC", "REQUIRED"),
+        ("currency", "STRING", "REQUIRED"),
+        ("region", "STRING", "REQUIRED"),
+        ("source_file", "STRING", "REQUIRED"),
+        ("source_checksum", "STRING", "REQUIRED"),
+        ("source_row_number", "INTEGER", "REQUIRED"),
+        ("source_row_id", "STRING", "REQUIRED"),
+        ("batch_date", "DATE", "REQUIRED"),
+        ("ingested_at", "TIMESTAMP", "REQUIRED"),
+        ("classified_at", "TIMESTAMP", "REQUIRED"),
+        ("amount_thb", "NUMERIC", "REQUIRED"),
+        ("amount_usd", "NUMERIC", "REQUIRED"),
+        ("amount_eur", "NUMERIC", "REQUIRED"),
+        ("fx_rate_date", "DATE", "REQUIRED"),
+        ("usd_thb_rate", "NUMERIC", "REQUIRED"),
+        ("eur_thb_rate", "NUMERIC", "REQUIRED"),
+        ("is_carried_forward", "BOOLEAN", "REQUIRED"),
+        ("staleness_days", "INTEGER", "REQUIRED"),
+        ("fact_created_at", "TIMESTAMP", "REQUIRED"),
+    ]
