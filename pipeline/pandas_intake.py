@@ -138,3 +138,37 @@ def prepare_transaction_frame(
     frame["batch_date"] = batch_date.isoformat()
     frame["ingested_at"] = _utc_text(ingested_at)
     return frame
+
+
+def prepare_fx_frame(
+    *,
+    source_bytes: bytes,
+    source_file: str,
+    source_checksum: str,
+    rate_date: date,
+    ingested_at: datetime,
+) -> pd.DataFrame:
+    verify_source_checksum(source_bytes, source_checksum)
+    frame = _read_source_csv(
+        source_bytes,
+        expected_columns=FX_SOURCE_COLUMNS,
+        compression=None,
+        label="FX",
+    ).rename(columns={"rate_date": "rate_date_raw"})
+    frame["source_file"] = source_file
+    frame["source_checksum"] = source_checksum
+    frame["source_row_number"] = range(1, len(frame) + 1)
+    frame["source_row_id"] = [
+        make_source_row_id(source_file, source_checksum, row_number)
+        for row_number in frame["source_row_number"]
+    ]
+    frame["rate_date"] = rate_date.isoformat()
+    frame["ingested_at"] = _utc_text(ingested_at)
+    return frame
+
+
+def anti_filter_existing(
+    frame: pd.DataFrame,
+    existing_ids: set[str],
+) -> pd.DataFrame:
+    return frame.loc[~frame["source_row_id"].isin(existing_ids)].reset_index(drop=True)
