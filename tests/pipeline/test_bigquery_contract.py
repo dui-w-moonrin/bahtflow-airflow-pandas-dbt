@@ -1,7 +1,11 @@
 from pipeline.bigquery_contract import (
+    ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
+    ACCEPTED_TRANSACTIONS_SCHEMA,
     DATASET_IDS,
     FX_RATES_PARTITION_FIELD,
     FX_RATES_SCHEMA,
+    QUARANTINE_TRANSACTIONS_PARTITION_FIELD,
+    QUARANTINE_TRANSACTIONS_SCHEMA,
     TRANSACTIONS_PARTITION_FIELD,
     TRANSACTIONS_SCHEMA,
 )
@@ -53,3 +57,40 @@ def test_fx_raw_schema_and_partition_contract():
         ("ingested_at", "TIMESTAMP", "REQUIRED"),
     ]
     assert FX_RATES_PARTITION_FIELD == "rate_date"
+
+
+def test_accepted_transactions_contract_is_exact():
+    assert _shape(ACCEPTED_TRANSACTIONS_SCHEMA) == [
+        ("txn", "STRING", "REQUIRED"),
+        ("transaction_dt", "DATETIME", "REQUIRED"),
+        ("amount", "NUMERIC", "REQUIRED"),
+        ("currency", "STRING", "REQUIRED"),
+        ("region", "STRING", "REQUIRED"),
+        ("source_file", "STRING", "REQUIRED"),
+        ("source_checksum", "STRING", "REQUIRED"),
+        ("source_row_number", "INTEGER", "REQUIRED"),
+        ("source_row_id", "STRING", "REQUIRED"),
+        ("batch_date", "DATE", "REQUIRED"),
+        ("ingested_at", "TIMESTAMP", "REQUIRED"),
+        ("classified_at", "TIMESTAMP", "REQUIRED"),
+    ]
+    assert ACCEPTED_TRANSACTIONS_PARTITION_FIELD == "batch_date"
+
+
+def test_quarantine_transactions_contract_is_exact():
+    assert _shape(QUARANTINE_TRANSACTIONS_SCHEMA) == [
+        ("txn", "STRING", "NULLABLE"),
+        ("dtts", "STRING", "NULLABLE"),
+        ("amount", "STRING", "NULLABLE"),
+        ("currency", "STRING", "NULLABLE"),
+        ("region", "STRING", "REQUIRED"),
+        ("source_file", "STRING", "REQUIRED"),
+        ("source_checksum", "STRING", "REQUIRED"),
+        ("source_row_number", "INTEGER", "REQUIRED"),
+        ("source_row_id", "STRING", "REQUIRED"),
+        ("batch_date", "DATE", "REQUIRED"),
+        ("ingested_at", "TIMESTAMP", "REQUIRED"),
+        ("reason_codes", "STRING", "REPEATED"),
+        ("quarantined_at", "TIMESTAMP", "REQUIRED"),
+    ]
+    assert QUARANTINE_TRANSACTIONS_PARTITION_FIELD == "batch_date"
