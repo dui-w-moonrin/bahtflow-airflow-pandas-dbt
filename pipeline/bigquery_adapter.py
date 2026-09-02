@@ -130,6 +130,31 @@ class BigQueryAdapter:
         ).result()
         return [dict(row.items()) for row in rows]
 
+    def query_rows_through_date(
+        self,
+        dataset_id: str,
+        table_id: str,
+        date_field: str,
+        through_date: date,
+        columns: tuple[str, ...],
+    ) -> list[dict]:
+        if not columns:
+            raise ValueError("columns must not be empty")
+
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        select_list = ", ".join(columns)
+        sql = (
+            f"SELECT {select_list} FROM `{full_id}` "
+            f"WHERE {date_field} <= @through_date"
+        )
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("through_date", "DATE", through_date)
+            ]
+        )
+        rows = self._client.query(sql, job_config=job_config).result()
+        return [dict(row.items()) for row in rows]
+
     def append_rows(
         self,
         dataset_id: str,
