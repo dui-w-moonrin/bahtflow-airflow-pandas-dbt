@@ -4,7 +4,7 @@
 
 **Goal:** Resolve the latest published USD/EUR FX snapshot at or before one logical batch date, convert every Feature 05 accepted transaction into THB/USD/EUR with Decimal arithmetic, and persist one idempotent BigQuery fact row per accepted transaction.
 
-**Architecture:** Keep all effective-FX selection, validation, Decimal normalization, and currency conversion in focused Pandas/Python modules. BigQuery is used only for exact-schema bootstrap, target-partition/history reads, append-only persistence, idempotency lookups, and partition counts. The one-batch loader composes those units and exposes a CLI; Airflow wiring is deferred to Feature 07.
+**Architecture:** Keep effective-FX selection, validation, BigQuery-NUMERIC normalization, and currency conversion in focused Pandas/Python modules. BigQuery is used only for exact-schema bootstrap, date/partition-scoped reads, append-only persistence, ID lookups, and counts. A one-batch loader composes those units and a narrow CLI exposes it; Airflow wiring remains Feature 07 scope.
 
 **Tech Stack:** Python 3.12, Pandas 2.3.3, Python `decimal.Decimal`, `google-cloud-bigquery` 3.44.0, pytest, Docker Compose, BigQuery.
 
@@ -15,24 +15,24 @@
 - Work on branch `feat/06-fx-currency-fact`, forked from `main` at Feature 05 completion commit `8915b5aab3161add8c3bf54b708014f66d3ecbc1`.
 - Use the user's normal feature-branch workflow; do not create or require a Git worktree.
 - Pandas/Python owns FX validation, effective-date resolution, conversion, and derived fields.
-- BigQuery SQL may only perform warehouse mechanics such as date-bounded reads, partition-scoped reads, ID lookups, and counts; it must not resolve effective FX or calculate converted amounts.
+- BigQuery SQL may only perform warehouse mechanics such as date-bounded reads, partition reads, ID lookups, and counts; it must not resolve effective FX or calculate converted amounts.
 - Resolve the **latest published** `rate_date <= batch_date`; if that newest publication is malformed, fail rather than falling back to an older valid publication.
 - The selected FX snapshot must contain exactly one USD row and one EUR row, with no unsupported extra currency.
-- `mid_rate` semantics are THB per one unit of USD or EUR.
+- `mid_rate` means THB per one unit of USD or EUR.
 - There is no maximum staleness threshold in v1.
 - All monetary and FX arithmetic uses `Decimal`; `float` is forbidden in the conversion path.
 - BigQuery `NUMERIC` storage normalization uses maximum scale 9, maximum integer digits 29, and `ROUND_HALF_EVEN` only when scale reduction is required.
 - `bahtflow_analytics.fct_transactions` is DAY-partitioned by `batch_date` and contains exactly one row per accepted transaction.
-- Reuse stable `source_row_id` as the fact idempotency key; persistence is partition-scoped anti-filter + `WRITE_APPEND` under the existing single-writer assumption.
+- Reuse stable `source_row_id` as the fact idempotency key; persistence is target-partition anti-filter + `WRITE_APPEND` under the existing single-writer assumption.
 - No `MERGE`, replace, truncate, delete, persisted effective-FX table, second quarantine stage, dbt, Airflow F07 wiring, or F08 mart work in this feature.
 - Primary live acceptance date is `2025-07-22`; Feature 05 measured 8,803 accepted rows for this partition.
 - Do not guess live FX rates, converted amounts, or first-run inserted counts; measure them from BigQuery.
 
 ## File Map
 
-- Create `pipeline/bigquery_numeric.py` — shared F06 Decimal parsing/BigQuery-NUMERIC normalization helper.
+- Create `pipeline/bigquery_numeric.py` — shared F06 Decimal parsing and BigQuery-NUMERIC normalization.
 - Create `pipeline/fx_resolution.py` — raw FX latest-publication selection, validation, and `EffectiveFxSnapshot`.
-- Create `pipeline/currency_fact.py` — accepted-row assumptions, THB bridge conversion, fact projection, and in-memory reconciliation.
+- Create `pipeline/currency_fact.py` — accepted-row assumptions, THB-bridge conversion, fact projection, and in-memory reconciliation.
 - Create `pipeline/currency_fact_load.py` — BigQuery reads, anti-filter append, persisted reconciliation, and summary.
 - Modify `pipeline/bigquery_contract.py` — exact `fct_transactions` schema constants.
 - Modify `pipeline/bigquery_adapter.py` — narrow date-bounded row reader for raw FX history.
@@ -79,7 +79,7 @@ def test_currency_fact_contract_is_exact():
     assert FACT_DATASET_ID == "bahtflow_analytics"
     assert FACT_TABLE_ID == "fct_transactions"
     assert FACT_TRANSACTIONS_PARTITION_FIELD == "batch_date"
-    assert [(field.name, field.field_type, field.mode) for field in FACT_TRANSACTIONS_SCHEMA] == [
+    assert [(f.name, f.field_type, f.mode) for f in FACT_TRANSACTIONS_SCHEMA] == [
         ("txn", "STRING", "REQUIRED"),
         ("transaction_dt", "DATETIME", "REQUIRED"),
         ("amount", "NUMERIC", "REQUIRED"),
@@ -106,13 +106,11 @@ def test_currency_fact_contract_is_exact():
 
 - [ ] **Step 2: Run the contract test and observe RED**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py::test_currency_fact_contract_is_exact -v
 ```
 
-Expected: collection/import failure because the F06 fact constants do not exist yet.
+Expected: collection/import failure because the F06 fact constants do not exist.
 
 - [ ] **Step 3: Add the exact fact contract**
 
@@ -148,8 +146,6 @@ FACT_TRANSACTIONS_PARTITION_FIELD = "batch_date"
 ```
 
 - [ ] **Step 4: Run the contract test and observe GREEN**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py::test_currency_fact_contract_is_exact -v
@@ -187,8 +183,6 @@ def test_bootstrap_currency_fact_targets_only_f06_fact_table():
 ```
 
 - [ ] **Step 6: Run the bootstrap test and observe RED**
-
-Run:
 
 ```powershell
 pytest tests/scripts/test_bootstrap_currency_fact.py -v
@@ -234,8 +228,6 @@ if __name__ == "__main__":
 
 - [ ] **Step 8: Run Task 1 tests**
 
-Run:
-
 ```powershell
 pytest tests/pipeline/test_bigquery_contract.py tests/scripts/test_bootstrap_currency_fact.py -v
 ```
@@ -258,7 +250,7 @@ git commit -m "feat: add currency fact BigQuery contract"
 - Modify: `tests/pipeline/test_bigquery_adapter.py`
 
 **Interfaces:**
-- Consumes: existing `BigQueryAdapter` and BigQuery query parameter pattern.
+- Consumes: existing `BigQueryAdapter` query pattern.
 - Produces: `BigQueryAdapter.query_rows_through_date(dataset_id: str, table_id: str, date_field: str, through_date: date, columns: tuple[str, ...]) -> list[dict]`.
 
 - [ ] **Step 1: Write the failing adapter test**
@@ -296,9 +288,7 @@ def test_query_rows_through_date_is_parameterized_and_returns_dicts():
     assert parameter.value == date(2025, 7, 22)
 ```
 
-- [ ] **Step 2: Run the test and observe RED**
-
-Run:
+- [ ] **Step 2: Run the adapter test and observe RED**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py::test_query_rows_through_date_is_parameterized_and_returns_dicts -v
@@ -306,7 +296,7 @@ pytest tests/pipeline/test_bigquery_adapter.py::test_query_rows_through_date_is_
 
 Expected: FAIL with `AttributeError` because `query_rows_through_date` is not implemented.
 
-- [ ] **Step 3: Add the minimal warehouse-mechanics reader**
+- [ ] **Step 3: Add the warehouse-mechanics reader**
 
 Add to `BigQueryAdapter` in `pipeline/bigquery_adapter.py`:
 
@@ -337,11 +327,9 @@ Add to `BigQueryAdapter` in `pipeline/bigquery_adapter.py`:
         return [dict(row.items()) for row in rows]
 ```
 
-Do not add `MAX(rate_date)`, currency filters, joins, conversion expressions, or fallback logic to SQL.
+Do not add `MAX(rate_date)`, business currency filtering, arithmetic, joins, or fallback logic to SQL.
 
 - [ ] **Step 4: Run adapter tests**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_bigquery_adapter.py -v
@@ -365,10 +353,10 @@ git commit -m "feat: add date-bounded BigQuery row reader"
 - Create: `tests/pipeline/test_bigquery_numeric.py`
 
 **Interfaces:**
-- Consumes: Python `Decimal` values or raw numeric text.
+- Consumes: `Decimal` or raw numeric text.
 - Produces: `BigQueryNumericError`; `normalize_bigquery_numeric(value: Decimal) -> Decimal`; `parse_bigquery_numeric_text(value) -> Decimal`.
 
-- [ ] **Step 1: Write failing tests for parsing, scale-9 rounding, and overflow**
+- [ ] **Step 1: Write failing normalization tests**
 
 Create `tests/pipeline/test_bigquery_numeric.py`:
 
@@ -404,9 +392,7 @@ def test_normalize_bigquery_numeric_rejects_more_than_29_integer_digits():
         normalize_bigquery_numeric(Decimal("123456789012345678901234567890"))
 ```
 
-- [ ] **Step 2: Run tests and observe RED**
-
-Run:
+- [ ] **Step 2: Run helper tests and observe RED**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_numeric.py -v
@@ -444,10 +430,9 @@ def normalize_bigquery_numeric(value: Decimal) -> Decimal:
 
     with localcontext() as context:
         context.prec = 80
-        exponent = value.as_tuple().exponent
         normalized = (
             value.quantize(NUMERIC_QUANTUM, rounding=ROUND_HALF_EVEN)
-            if exponent < -9
+            if value.as_tuple().exponent < -9
             else value
         )
 
@@ -465,13 +450,13 @@ def parse_bigquery_numeric_text(value) -> Decimal:
     try:
         parsed = Decimal(text)
     except InvalidOperation as exc:
-        raise BigQueryNumericError(f"Invalid BigQuery NUMERIC value: {value!r}") from exc
+        raise BigQueryNumericError(
+            f"Invalid BigQuery NUMERIC value: {value!r}"
+        ) from exc
     return normalize_bigquery_numeric(parsed)
 ```
 
 - [ ] **Step 4: Run helper tests**
-
-Run:
 
 ```powershell
 pytest tests/pipeline/test_bigquery_numeric.py -v
@@ -495,12 +480,12 @@ git commit -m "feat: add Decimal NUMERIC normalization"
 - Create: `tests/pipeline/test_fx_resolution.py`
 
 **Interfaces:**
-- Consumes: a Pandas DataFrame containing raw FX history rows with `rate_date <= batch_date`.
-- Produces: `FxResolutionError`; immutable `EffectiveFxSnapshot(fx_rate_date: date, usd_thb_rate: Decimal, eur_thb_rate: Decimal, is_carried_forward: bool, staleness_days: int)`; `resolve_effective_fx(raw_fx_df: pd.DataFrame, batch_date: date) -> EffectiveFxSnapshot`.
+- Consumes: raw FX history DataFrame and `batch_date: date`.
+- Produces: `FxResolutionError`; immutable `EffectiveFxSnapshot`; `RAW_FX_COLUMNS`; `resolve_effective_fx(raw_fx_df: pd.DataFrame, batch_date: date) -> EffectiveFxSnapshot`.
 
-- [ ] **Step 1: Write the initial RED tests for same-day, carry-forward, and future exclusion**
+- [ ] **Step 1: Write initial RED tests for same-day and carry-forward selection**
 
-Create `tests/pipeline/test_fx_resolution.py` with these helpers and tests:
+Create `tests/pipeline/test_fx_resolution.py`:
 
 ```python
 from datetime import date
@@ -512,7 +497,7 @@ import pytest
 from pipeline.fx_resolution import FxResolutionError, resolve_effective_fx
 
 
-def fx_row(rate_date, currency, mid_rate, *, rate_date_raw=None):
+def fx_row(rate_date, currency, mid_rate, *, rate_date_raw=None, row_number=None):
     return {
         "rate_date_raw": rate_date_raw or rate_date.isoformat(),
         "currency": currency,
@@ -522,15 +507,18 @@ def fx_row(rate_date, currency, mid_rate, *, rate_date_raw=None):
         "source_url": "https://example.test/fx",
         "source_file": f"fx/{rate_date:%Y}/{rate_date:%m}/fx_{rate_date:%Y%m%d}.csv",
         "source_checksum": "abc",
-        "source_row_number": 1 if currency == "USD" else 2,
-        "source_row_id": f"{rate_date}-{currency}",
+        "source_row_number": row_number or (1 if currency == "USD" else 2),
+        "source_row_id": f"{rate_date}-{currency}-{row_number or 0}",
         "rate_date": rate_date,
         "ingested_at": "2026-09-02T00:00:00Z",
     }
 
 
 def pair(rate_date, usd="32.50", eur="37.25"):
-    return [fx_row(rate_date, "USD", usd), fx_row(rate_date, "EUR", eur)]
+    return [
+        fx_row(rate_date, "USD", usd, row_number=1),
+        fx_row(rate_date, "EUR", eur, row_number=2),
+    ]
 
 
 def test_same_day_pair_resolves_without_carry_forward():
@@ -558,9 +546,7 @@ def test_latest_prior_pair_is_carried_forward_and_future_is_ignored():
     assert snapshot.staleness_days == 1
 ```
 
-- [ ] **Step 2: Run targeted tests and observe RED**
-
-Run:
+- [ ] **Step 2: Run initial resolver tests and observe RED**
 
 ```powershell
 pytest tests/pipeline/test_fx_resolution.py -v
@@ -568,15 +554,15 @@ pytest tests/pipeline/test_fx_resolution.py -v
 
 Expected: collection/import failure because `pipeline.fx_resolution` does not exist.
 
-- [ ] **Step 3: Implement only the public types and successful resolution path**
+- [ ] **Step 3: Implement the successful resolver path**
 
-Create `pipeline/fx_resolution.py` with `RAW_FX_COLUMNS`, `FxResolutionError`, `EffectiveFxSnapshot`, required-column validation, date filtering, latest-date selection, exact USD/EUR mapping, positive Decimal rate parsing through `parse_bigquery_numeric_text`, and staleness calculation. Keep selection in Pandas; do not call BigQuery from this module.
-
-Use this public shape:
+Create `pipeline/fx_resolution.py`:
 
 ```python
+from __future__ import annotations
+
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -611,56 +597,134 @@ class EffectiveFxSnapshot:
     eur_thb_rate: Decimal
     is_carried_forward: bool
     staleness_days: int
+
+
+def _as_date(value, label: str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise FxResolutionError(f"Invalid {label}: {value!r}") from exc
+
+
+def _require_columns(frame: pd.DataFrame) -> None:
+    missing = [column for column in RAW_FX_COLUMNS if column not in frame.columns]
+    if missing:
+        raise FxResolutionError(f"Missing raw FX columns: {missing!r}")
+
+
+def _positive_rate(value, currency: str) -> Decimal:
+    try:
+        rate = parse_bigquery_numeric_text(value)
+    except BigQueryNumericError as exc:
+        raise FxResolutionError(f"Invalid FX rate for {currency}: {value!r}") from exc
+    if rate <= Decimal("0"):
+        raise FxResolutionError(f"Invalid FX rate for {currency}: {value!r}")
+    return rate
+
+
+def resolve_effective_fx(raw_fx_df: pd.DataFrame, batch_date: date) -> EffectiveFxSnapshot:
+    _require_columns(raw_fx_df)
+    frame = raw_fx_df.loc[:, list(RAW_FX_COLUMNS)].copy()
+    frame["_rate_date"] = frame["rate_date"].map(
+        lambda value: _as_date(value, "rate_date")
+    )
+    eligible = frame.loc[frame["_rate_date"].map(lambda d: d <= batch_date)].copy()
+    if eligible.empty:
+        raise FxResolutionError(
+            f"No FX publication at or before batch_date={batch_date.isoformat()}"
+        )
+
+    latest_date = max(eligible["_rate_date"])
+    selected = eligible.loc[eligible["_rate_date"] == latest_date].copy()
+    selected["_currency"] = selected["currency"].map(
+        lambda value: str(value).strip().upper()
+    )
+    if len(selected) != 2 or set(selected["_currency"]) != {"USD", "EUR"}:
+        raise FxResolutionError(
+            f"Latest FX publication is not an exact USD/EUR pair: {latest_date}"
+        )
+
+    rates = {}
+    for record in selected.to_dict(orient="records"):
+        raw_date = _as_date(record["rate_date_raw"], "rate_date_raw")
+        if raw_date != latest_date:
+            raise FxResolutionError(
+                f"rate_date_raw mismatch: raw={raw_date} canonical={latest_date}"
+            )
+        currency = record["_currency"]
+        rates[currency] = _positive_rate(record["mid_rate"], currency)
+
+    staleness_days = (batch_date - latest_date).days
+    return EffectiveFxSnapshot(
+        fx_rate_date=latest_date,
+        usd_thb_rate=rates["USD"],
+        eur_thb_rate=rates["EUR"],
+        is_carried_forward=latest_date < batch_date,
+        staleness_days=staleness_days,
+    )
 ```
 
-For the successful path, filter `rate_date <= batch_date` defensively even though the adapter already applies that bound, select `max(rate_date)`, and require `set(selected["currency"]) == {"USD", "EUR"}` with exactly two rows.
-
-- [ ] **Step 4: Run the two initial tests and observe GREEN**
-
-Run:
+- [ ] **Step 4: Run the initial resolver tests and observe GREEN**
 
 ```powershell
-pytest tests/pipeline/test_fx_resolution.py::test_same_day_pair_resolves_without_carry_forward tests/pipeline/test_fx_resolution.py::test_latest_prior_pair_is_carried_forward_and_future_is_ignored -v
+pytest tests/pipeline/test_fx_resolution.py -v
 ```
 
-Expected: both PASS.
+Expected: both initial tests PASS.
 
-- [ ] **Step 5: Add RED edge-case tests for the full spec**
+- [ ] **Step 5: Add RED tests for malformed latest publications**
 
-Append tests that assert `FxResolutionError` for each case below using the same `fx_row`/`pair` fixtures:
+Append to `tests/pipeline/test_fx_resolution.py`:
 
 ```python
 def test_no_prior_publication_fails():
-    rows = pair(date(2025, 7, 23))
     with pytest.raises(FxResolutionError, match="No FX publication"):
-        resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
+        resolve_effective_fx(
+            pd.DataFrame(pair(date(2025, 7, 23))),
+            date(2025, 7, 22),
+        )
 
 
 def test_latest_publication_missing_eur_fails_without_falling_back():
     rows = pair(date(2025, 7, 20))
-    rows.append(fx_row(date(2025, 7, 21), "USD", "32.00"))
+    rows.append(fx_row(date(2025, 7, 21), "USD", "32.00", row_number=1))
+    with pytest.raises(FxResolutionError, match="exact USD/EUR pair"):
+        resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
+
+
+def test_latest_publication_missing_usd_fails_without_falling_back():
+    rows = pair(date(2025, 7, 20))
+    rows.append(fx_row(date(2025, 7, 21), "EUR", "37.00", row_number=2))
     with pytest.raises(FxResolutionError, match="exact USD/EUR pair"):
         resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
 
 
 def test_duplicate_currency_fails():
     d = date(2025, 7, 21)
-    rows = pair(d) + [fx_row(d, "USD", "32.60")]
+    rows = pair(d) + [fx_row(d, "USD", "32.60", row_number=3)]
     with pytest.raises(FxResolutionError, match="exact USD/EUR pair"):
         resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
 
 
 def test_unsupported_extra_currency_fails():
     d = date(2025, 7, 21)
-    rows = pair(d) + [fx_row(d, "JPY", "0.22")]
+    rows = pair(d) + [fx_row(d, "JPY", "0.22", row_number=3)]
     with pytest.raises(FxResolutionError, match="exact USD/EUR pair"):
         resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
 
 
-@pytest.mark.parametrize("rate", ["", "N/A", "NaN", "0", "-1"])
-def test_invalid_nonpositive_rate_fails(rate):
+@pytest.mark.parametrize("rate", ["", "N/A", "NaN", "Infinity", "0", "-1"])
+def test_invalid_or_nonpositive_rate_fails(rate):
     d = date(2025, 7, 21)
-    rows = [fx_row(d, "USD", rate), fx_row(d, "EUR", "37.25")]
+    rows = [
+        fx_row(d, "USD", rate, row_number=1),
+        fx_row(d, "EUR", "37.25", row_number=2),
+    ]
     with pytest.raises(FxResolutionError, match="Invalid FX rate"):
         resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
 
@@ -668,40 +732,28 @@ def test_invalid_nonpositive_rate_fails(rate):
 def test_rate_date_raw_mismatch_fails():
     d = date(2025, 7, 21)
     rows = [
-        fx_row(d, "USD", "32.50", rate_date_raw="2025-07-20"),
-        fx_row(d, "EUR", "37.25"),
+        fx_row(
+            d,
+            "USD",
+            "32.50",
+            rate_date_raw="2025-07-20",
+            row_number=1,
+        ),
+        fx_row(d, "EUR", "37.25", row_number=2),
     ]
-    with pytest.raises(FxResolutionError, match="rate_date_raw"):
+    with pytest.raises(FxResolutionError, match="rate_date_raw mismatch"):
         resolve_effective_fx(pd.DataFrame(rows), date(2025, 7, 22))
 ```
 
-Also add a missing-USD test symmetric to missing-EUR.
-
-- [ ] **Step 6: Run the expanded suite and observe RED failures for unimplemented validation**
-
-Run:
-
-```powershell
-pytest tests/pipeline/test_fx_resolution.py -v
-```
-
-Expected: at least one edge-case test FAILS until all specified validation is implemented.
-
-- [ ] **Step 7: Implement the remaining validation minimally**
-
-Update `resolve_effective_fx` so the **selected latest publication only** is validated. Parse canonical `rate_date` values as Python `date` if BigQuery provided date objects; if test fixtures or fakes provide ISO strings, normalize with `date.fromisoformat(str(value))`. Require every selected `rate_date_raw` to parse with `date.fromisoformat(str(value).strip())` and equal the selected canonical date. Convert `currency` with `str(value).strip().upper()` only for validation/mapping; raw FX table remains unchanged. Wrap `BigQueryNumericError` as `FxResolutionError("Invalid FX rate ...")`. Require each parsed rate `> Decimal("0")`.
-
-- [ ] **Step 8: Run the full FX resolver suite**
-
-Run:
+- [ ] **Step 6: Run the expanded resolver suite**
 
 ```powershell
 pytest tests/pipeline/test_fx_resolution.py tests/pipeline/test_bigquery_numeric.py -v
 ```
 
-Expected: all selected tests PASS.
+Expected: all selected tests PASS because the implementation validates only the latest selected publication and never falls back.
 
-- [ ] **Step 9: Commit Task 4**
+- [ ] **Step 7: Commit Task 4**
 
 ```powershell
 git add pipeline/fx_resolution.py tests/pipeline/test_fx_resolution.py
@@ -720,9 +772,9 @@ git commit -m "feat: resolve effective FX snapshots"
 - Consumes: Feature 05 accepted DataFrame, `batch_date: date`, `EffectiveFxSnapshot`, `fact_created_at: datetime`.
 - Produces: `CurrencyFactError`; `ACCEPTED_INPUT_COLUMNS`; `FACT_COLUMNS`; `build_currency_fact(accepted_df: pd.DataFrame, batch_date: date, fx: EffectiveFxSnapshot, fact_created_at: datetime) -> pd.DataFrame`.
 
-- [ ] **Step 1: Write the RED happy-path conversion tests**
+- [ ] **Step 1: Write RED conversion tests**
 
-Create `tests/pipeline/test_currency_fact.py` with one THB, one USD, and one EUR accepted row. Use amounts that make expected Decimal math obvious, for example rates USD=32 and EUR=40:
+Create `tests/pipeline/test_currency_fact.py`:
 
 ```python
 from datetime import date, datetime, timezone
@@ -750,7 +802,7 @@ def accepted_row(txn, amount, currency, source_row_id):
     return {
         "txn": txn,
         "transaction_dt": datetime(2025, 7, 22, 9, 30),
-        "amount": Decimal(amount),
+        "amount": Decimal(amount) if isinstance(amount, str) else amount,
         "currency": currency,
         "region": "bkk",
         "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz",
@@ -773,38 +825,52 @@ def test_build_currency_fact_converts_thb_usd_eur_and_preserves_identity():
     fact = build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
 
     by_txn = fact.set_index("txn")
-    assert by_txn.loc["T-THB", "amount_thb"] == Decimal("320")
-    assert by_txn.loc["T-THB", "amount_usd"] == Decimal("10")
-    assert by_txn.loc["T-THB", "amount_eur"] == Decimal("8")
-    assert by_txn.loc["T-USD", "amount_thb"] == Decimal("320")
-    assert by_txn.loc["T-USD", "amount_usd"] == Decimal("10")
-    assert by_txn.loc["T-USD", "amount_eur"] == Decimal("8")
-    assert by_txn.loc["T-EUR", "amount_thb"] == Decimal("320")
-    assert by_txn.loc["T-EUR", "amount_usd"] == Decimal("10")
-    assert by_txn.loc["T-EUR", "amount_eur"] == Decimal("8")
+    for txn in ("T-THB", "T-USD", "T-EUR"):
+        assert by_txn.loc[txn, "amount_thb"] == Decimal("320")
+        assert by_txn.loc[txn, "amount_usd"] == Decimal("10")
+        assert by_txn.loc[txn, "amount_eur"] == Decimal("8")
     assert fact["source_row_id"].tolist() == ["row-thb", "row-usd", "row-eur"]
+    assert fact["amount"].tolist() == [Decimal("320"), Decimal("10"), Decimal("8")]
+    assert fact["currency"].tolist() == ["THB", "USD", "EUR"]
+    assert fact["fx_rate_date"].tolist() == [date(2025, 7, 21)] * 3
+    assert fact["is_carried_forward"].tolist() == [True] * 3
+    assert fact["staleness_days"].tolist() == [1] * 3
     assert len(fact) == len(accepted)
+
+
+def test_derived_division_is_normalized_to_scale_nine():
+    fx = EffectiveFxSnapshot(
+        fx_rate_date=BATCH_DATE,
+        usd_thb_rate=Decimal("3"),
+        eur_thb_rate=Decimal("7"),
+        is_carried_forward=False,
+        staleness_days=0,
+    )
+    accepted = pd.DataFrame([accepted_row("T", "1", "THB", "row-1")])
+
+    fact = build_currency_fact(accepted, BATCH_DATE, fx, WHEN)
+
+    assert fact.iloc[0]["amount_usd"] == Decimal("0.333333333")
+    assert fact.iloc[0]["amount_eur"] == Decimal("0.142857143")
 ```
 
-- [ ] **Step 2: Run and observe RED**
-
-Run:
+- [ ] **Step 2: Run conversion tests and observe RED**
 
 ```powershell
-pytest tests/pipeline/test_currency_fact.py::test_build_currency_fact_converts_thb_usd_eur_and_preserves_identity -v
+pytest tests/pipeline/test_currency_fact.py -v
 ```
 
 Expected: collection/import failure because `pipeline.currency_fact` does not exist.
 
-- [ ] **Step 3: Implement the minimal successful conversion path**
+- [ ] **Step 3: Implement the successful conversion path**
 
-Create `pipeline/currency_fact.py` with:
+Create `pipeline/currency_fact.py`:
 
 ```python
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal, DecimalException, localcontext
 
 import pandas as pd
 
@@ -842,39 +908,165 @@ FACT_COLUMNS = ACCEPTED_INPUT_COLUMNS + (
     "staleness_days",
     "fact_created_at",
 )
+
+VALID_CURRENCIES = frozenset({"THB", "USD", "EUR"})
+
+
+def _as_batch_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise CurrencyFactError(f"Invalid accepted batch_date: {value!r}") from exc
+
+
+def _validate_accepted(accepted_df: pd.DataFrame, batch_date: date) -> None:
+    missing = [
+        column for column in ACCEPTED_INPUT_COLUMNS if column not in accepted_df.columns
+    ]
+    if missing:
+        raise CurrencyFactError(f"Missing accepted columns: {missing!r}")
+
+    normalized_dates = accepted_df["batch_date"].map(_as_batch_date)
+    if not normalized_dates.map(lambda value: value == batch_date).all():
+        raise CurrencyFactError("Accepted batch_date does not match target batch_date")
+
+    source_ids = accepted_df["source_row_id"].map(
+        lambda value: "" if value is None else str(value).strip()
+    )
+    if source_ids.eq("").any() or source_ids.duplicated().any():
+        raise CurrencyFactError("Accepted source_row_id must be nonblank and unique")
+
+    for position, row in accepted_df.reset_index(drop=True).iterrows():
+        amount = row["amount"]
+        if not isinstance(amount, Decimal) or not amount.is_finite() or amount < 0:
+            raise CurrencyFactError(
+                f"Invalid accepted amount for source_row_id={row['source_row_id']}: {amount!r}"
+            )
+        try:
+            normalized = normalize_bigquery_numeric(amount)
+        except BigQueryNumericError as exc:
+            raise CurrencyFactError(
+                f"Invalid accepted amount for source_row_id={row['source_row_id']}"
+            ) from exc
+        if normalized != amount:
+            raise CurrencyFactError(
+                f"Accepted amount requires unexpected normalization at row={position}"
+            )
+        if row["currency"] not in VALID_CURRENCIES:
+            raise CurrencyFactError(
+                f"Invalid accepted currency for source_row_id={row['source_row_id']}: "
+                f"{row['currency']!r}"
+            )
+
+
+def _convert_amount(
+    amount: Decimal,
+    currency: str,
+    usd_rate: Decimal,
+    eur_rate: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    with localcontext() as context:
+        context.prec = 80
+        if currency == "THB":
+            amount_thb = amount
+        elif currency == "USD":
+            amount_thb = amount * usd_rate
+        else:
+            amount_thb = amount * eur_rate
+        amount_usd = amount_thb / usd_rate
+        amount_eur = amount_thb / eur_rate
+    return (
+        normalize_bigquery_numeric(amount_thb),
+        normalize_bigquery_numeric(amount_usd),
+        normalize_bigquery_numeric(amount_eur),
+    )
+
+
+def build_currency_fact(
+    accepted_df: pd.DataFrame,
+    batch_date: date,
+    fx: EffectiveFxSnapshot,
+    fact_created_at: datetime,
+) -> pd.DataFrame:
+    _validate_accepted(accepted_df, batch_date)
+    try:
+        usd_rate = normalize_bigquery_numeric(fx.usd_thb_rate)
+        eur_rate = normalize_bigquery_numeric(fx.eur_thb_rate)
+    except BigQueryNumericError as exc:
+        raise CurrencyFactError("FX snapshot contains nonrepresentable rate") from exc
+    if usd_rate <= 0 or eur_rate <= 0:
+        raise CurrencyFactError("FX snapshot rates must be positive")
+
+    records = []
+    for row in accepted_df.loc[:, list(ACCEPTED_INPUT_COLUMNS)].to_dict(orient="records"):
+        try:
+            amount_thb, amount_usd, amount_eur = _convert_amount(
+                row["amount"], row["currency"], usd_rate, eur_rate
+            )
+        except (BigQueryNumericError, DecimalException, ZeroDivisionError) as exc:
+            raise CurrencyFactError(
+                f"Currency conversion failed for source_row_id={row['source_row_id']}"
+            ) from exc
+        records.append(
+            {
+                **row,
+                "amount_thb": amount_thb,
+                "amount_usd": amount_usd,
+                "amount_eur": amount_eur,
+                "fx_rate_date": fx.fx_rate_date,
+                "usd_thb_rate": usd_rate,
+                "eur_thb_rate": eur_rate,
+                "is_carried_forward": fx.is_carried_forward,
+                "staleness_days": fx.staleness_days,
+                "fact_created_at": fact_created_at,
+            }
+        )
+
+    fact = pd.DataFrame(records, columns=list(FACT_COLUMNS))
+    if len(accepted_df) != len(fact):
+        raise CurrencyFactError(
+            f"Fact count reconciliation failed: accepted={len(accepted_df)} fact={len(fact)}"
+        )
+    accepted_ids = set(accepted_df["source_row_id"])
+    fact_ids = set(fact["source_row_id"])
+    if accepted_ids != fact_ids:
+        raise CurrencyFactError("Fact source_row_id reconciliation failed")
+    return fact
 ```
 
-Implement a row conversion using `localcontext()` with precision 80, THB bridge formulas from the spec, and `normalize_bigquery_numeric` on `amount_thb`, `amount_usd`, `amount_eur`, `usd_thb_rate`, and `eur_thb_rate`. Preserve the original accepted `amount` and `currency` fields unchanged.
+- [ ] **Step 4: Run initial conversion tests and observe GREEN**
 
-- [ ] **Step 4: Run the happy-path test and observe GREEN**
+```powershell
+pytest tests/pipeline/test_currency_fact.py -v
+```
 
-Run the targeted test from Step 2. Expected: PASS.
+Expected: initial conversion tests PASS.
 
-- [ ] **Step 5: Add RED tests for precision and impossible post-F05 states**
+- [ ] **Step 5: Add RED tests for impossible post-F05 states and overflow**
 
-Append tests asserting:
+Append to `tests/pipeline/test_currency_fact.py`:
 
 ```python
-def test_derived_division_is_normalized_to_scale_nine_half_even():
-    fx = EffectiveFxSnapshot(
-        fx_rate_date=BATCH_DATE,
-        usd_thb_rate=Decimal("3"),
-        eur_thb_rate=Decimal("7"),
-        is_carried_forward=False,
-        staleness_days=0,
-    )
-    accepted = pd.DataFrame([accepted_row("T", "1", "THB", "row-1")])
-
-    fact = build_currency_fact(accepted, BATCH_DATE, fx, WHEN)
-
-    assert fact.iloc[0]["amount_usd"] == Decimal("0.333333333")
-    assert fact.iloc[0]["amount_eur"] == Decimal("0.142857143")
-
-
 @pytest.mark.parametrize("currency", ["JPY", "", None])
 def test_impossible_accepted_currency_fails(currency):
     accepted = pd.DataFrame([accepted_row("T", "1", currency, "row-1")])
     with pytest.raises(CurrencyFactError, match="accepted currency"):
+        build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
+
+
+def test_non_decimal_accepted_amount_fails():
+    accepted = pd.DataFrame([accepted_row("T", 1.5, "THB", "row-1")])
+    with pytest.raises(CurrencyFactError, match="accepted amount"):
+        build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
+
+
+def test_negative_accepted_amount_fails():
+    accepted = pd.DataFrame([accepted_row("T", "-1", "THB", "row-1")])
+    with pytest.raises(CurrencyFactError, match="accepted amount"):
         build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
 
 
@@ -892,36 +1084,24 @@ def test_duplicate_source_row_id_in_accepted_fails():
     ])
     with pytest.raises(CurrencyFactError, match="source_row_id"):
         build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
+
+
+def test_derived_numeric_overflow_fails():
+    huge_fx = EffectiveFxSnapshot(
+        fx_rate_date=BATCH_DATE,
+        usd_thb_rate=Decimal("99999999999999999999999999999"),
+        eur_thb_rate=Decimal("40"),
+        is_carried_forward=False,
+        staleness_days=0,
+    )
+    accepted = pd.DataFrame([
+        accepted_row("T", "99999999999999999999999999999", "USD", "row-1")
+    ])
+    with pytest.raises(CurrencyFactError, match="Currency conversion failed"):
+        build_currency_fact(accepted, BATCH_DATE, huge_fx, WHEN)
 ```
 
-Also test non-Decimal accepted amount and a derived value that exceeds 29 integer digits, both raising `CurrencyFactError`.
-
-- [ ] **Step 6: Run the expanded suite and observe RED where validation is missing**
-
-Run:
-
-```powershell
-pytest tests/pipeline/test_currency_fact.py -v
-```
-
-Expected: one or more edge-case tests FAIL until validation is complete.
-
-- [ ] **Step 7: Implement validation and exact in-memory reconciliation**
-
-Before conversion require all `ACCEPTED_INPUT_COLUMNS`, exact target `batch_date`, unique/nonblank `source_row_id`, `amount` values that are finite `Decimal` and non-negative, and currency in `{THB, USD, EUR}`. Wrap `BigQueryNumericError`, `decimal` arithmetic errors, or divide errors as `CurrencyFactError` with the transaction/source-row identifier in the message.
-
-After projection verify:
-
-```python
-if len(accepted_df) != len(fact):
-    raise CurrencyFactError(...)
-if set(accepted_df["source_row_id"]) != set(fact["source_row_id"]):
-    raise CurrencyFactError(...)
-```
-
-- [ ] **Step 8: Run conversion + numeric suites**
-
-Run:
+- [ ] **Step 6: Run the expanded conversion suite**
 
 ```powershell
 pytest tests/pipeline/test_currency_fact.py tests/pipeline/test_bigquery_numeric.py tests/pipeline/test_fx_resolution.py -v
@@ -929,7 +1109,7 @@ pytest tests/pipeline/test_currency_fact.py tests/pipeline/test_bigquery_numeric
 
 Expected: all selected tests PASS.
 
-- [ ] **Step 9: Commit Task 5**
+- [ ] **Step 7: Commit Task 5**
 
 ```powershell
 git add pipeline/currency_fact.py tests/pipeline/test_currency_fact.py
@@ -945,55 +1125,261 @@ git commit -m "feat: build converted transaction facts"
 - Create: `tests/pipeline/test_currency_fact_load.py`
 
 **Interfaces:**
-- Consumes: `BigQueryAdapter.query_partition_rows`, `query_rows_through_date`, `query_source_row_ids`, `append_rows`, `query_partition_row_count`; `resolve_effective_fx`; `build_currency_fact`.
-- Produces: `CurrencyFactLoadError`; immutable `CurrencyFactLoadSummary`; `build_and_load_currency_fact(batch_date: date, bigquery_adapter, fact_created_at: datetime | None = None) -> CurrencyFactLoadSummary`.
+- Consumes: adapter methods `query_partition_rows`, `query_rows_through_date`, `query_source_row_ids`, `append_rows`, `query_partition_row_count`; `resolve_effective_fx`; `build_currency_fact`.
+- Produces: `CurrencyFactLoadError`; `CurrencyFactLoadSummary`; `build_and_load_currency_fact(batch_date: date, bigquery_adapter, fact_created_at: datetime | None = None) -> CurrencyFactLoadSummary`.
 
-- [ ] **Step 1: Write a stateful fake and RED first-run/rerun test**
+- [ ] **Step 1: Write the stateful fake and RED persistence tests**
 
-Create `tests/pipeline/test_currency_fact_load.py`. The fake should maintain accepted inputs, raw FX history, and persisted fact rows in memory. Its methods must implement the same five adapter calls used by production. Use one THB and one USD accepted row plus a complete same-day FX pair.
-
-The first test must assert:
+Create `tests/pipeline/test_currency_fact_load.py`:
 
 ```python
-first = build_and_load_currency_fact(
-    batch_date=BATCH_DATE,
-    bigquery_adapter=fake,
-    fact_created_at=WHEN,
+from datetime import date, datetime, timezone
+from decimal import Decimal
+
+import pandas as pd
+import pytest
+
+from pipeline.currency_fact import build_currency_fact
+from pipeline.currency_fact_load import (
+    CurrencyFactLoadError,
+    build_and_load_currency_fact,
 )
-second = build_and_load_currency_fact(
-    batch_date=BATCH_DATE,
-    bigquery_adapter=fake,
-    fact_created_at=WHEN,
+from pipeline.fx_resolution import EffectiveFxSnapshot
+
+
+BATCH_DATE = date(2025, 7, 22)
+WHEN = datetime(2026, 9, 2, 10, 0, tzinfo=timezone.utc)
+FX = EffectiveFxSnapshot(
+    fx_rate_date=BATCH_DATE,
+    usd_thb_rate=Decimal("32"),
+    eur_thb_rate=Decimal("40"),
+    is_carried_forward=False,
+    staleness_days=0,
 )
 
-assert first.accepted_rows == 2
-assert first.fact_rows == 2
-assert first.fact_inserted_rows == 2
-assert first.accepted_partition_rows == 2
-assert first.fact_partition_rows == 2
-assert first.reconciled is True
-assert second.fact_inserted_rows == 0
-assert second.fact_partition_rows == 2
-assert second.reconciled is True
+
+def accepted_row(txn, amount, currency, source_row_id, row_number):
+    return {
+        "txn": txn,
+        "transaction_dt": datetime(2025, 7, 22, 9, 30),
+        "amount": Decimal(amount),
+        "currency": currency,
+        "region": "bkk",
+        "source_file": "transactions/business_date=2025-07-22/sales_bkk_20250722.csv.gz",
+        "source_checksum": "abc",
+        "source_row_number": row_number,
+        "source_row_id": source_row_id,
+        "batch_date": BATCH_DATE,
+        "ingested_at": datetime(2026, 9, 2, tzinfo=timezone.utc),
+        "classified_at": datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc),
+    }
+
+
+def fx_row(currency, rate, row_number):
+    return {
+        "rate_date_raw": BATCH_DATE.isoformat(),
+        "currency": currency,
+        "mid_rate": rate,
+        "rate_unit": "THB",
+        "source_provider": "BOT",
+        "source_url": "https://example.test/fx",
+        "source_file": "fx/2025/07/fx_20250722.csv",
+        "source_checksum": "fx-abc",
+        "source_row_number": row_number,
+        "source_row_id": f"fx-{currency}",
+        "rate_date": BATCH_DATE,
+        "ingested_at": datetime(2026, 9, 2, tzinfo=timezone.utc),
+    }
+
+
+def row_matches_date(row, partition_date):
+    return row["batch_date"] in (partition_date, partition_date.isoformat())
+
+
+class StatefulFactFake:
+    def __init__(self):
+        self.accepted_rows = [
+            accepted_row("T1", "320", "THB", "row-1", 1),
+            accepted_row("T2", "10", "USD", "row-2", 2),
+        ]
+        self.fx_rows = [fx_row("USD", "32", 1), fx_row("EUR", "40", 2)]
+        self.fact_rows = []
+
+    def query_partition_rows(
+        self, dataset_id, table_id, partition_field, partition_date, columns
+    ):
+        assert (dataset_id, table_id, partition_field) == (
+            "bahtflow_analytics",
+            "transactions_accepted",
+            "batch_date",
+        )
+        return [
+            {column: row[column] for column in columns}
+            for row in self.accepted_rows
+            if row_matches_date(row, partition_date)
+        ]
+
+    def query_rows_through_date(
+        self, dataset_id, table_id, date_field, through_date, columns
+    ):
+        assert (dataset_id, table_id, date_field) == (
+            "bahtflow_raw",
+            "fx_rates",
+            "rate_date",
+        )
+        return [
+            {column: row[column] for column in columns}
+            for row in self.fx_rows
+            if row["rate_date"] <= through_date
+        ]
+
+    def query_source_row_ids(
+        self, dataset_id, table_id, partition_field, partition_date
+    ):
+        assert (dataset_id, table_id, partition_field) == (
+            "bahtflow_analytics",
+            "fct_transactions",
+            "batch_date",
+        )
+        return {
+            row["source_row_id"]
+            for row in self.fact_rows
+            if row_matches_date(row, partition_date)
+        }
+
+    def append_rows(self, dataset_id, table_id, rows, schema):
+        assert (dataset_id, table_id) == (
+            "bahtflow_analytics",
+            "fct_transactions",
+        )
+        self.fact_rows.extend(rows)
+        return len(rows)
+
+    def query_partition_row_count(
+        self, dataset_id, table_id, partition_field, partition_date
+    ):
+        assert partition_field == "batch_date"
+        if (dataset_id, table_id) == (
+            "bahtflow_analytics",
+            "transactions_accepted",
+        ):
+            return sum(
+                1 for row in self.accepted_rows if row_matches_date(row, partition_date)
+            )
+        assert (dataset_id, table_id) == (
+            "bahtflow_analytics",
+            "fct_transactions",
+        )
+        return sum(
+            1 for row in self.fact_rows if row_matches_date(row, partition_date)
+        )
+
+
+def test_first_run_builds_fact_and_rerun_inserts_zero():
+    fake = StatefulFactFake()
+
+    first = build_and_load_currency_fact(
+        batch_date=BATCH_DATE,
+        bigquery_adapter=fake,
+        fact_created_at=WHEN,
+    )
+    second = build_and_load_currency_fact(
+        batch_date=BATCH_DATE,
+        bigquery_adapter=fake,
+        fact_created_at=WHEN,
+    )
+
+    assert first.accepted_rows == 2
+    assert first.fact_rows == 2
+    assert first.fact_inserted_rows == 2
+    assert first.accepted_partition_rows == 2
+    assert first.fact_partition_rows == 2
+    assert first.reconciled is True
+    assert second.fact_inserted_rows == 0
+    assert second.fact_partition_rows == 2
+    assert second.reconciled is True
+
+
+def test_retry_with_one_persisted_fact_appends_only_missing_row():
+    fake = StatefulFactFake()
+    accepted = pd.DataFrame(fake.accepted_rows)
+    generated = build_currency_fact(accepted, BATCH_DATE, FX, WHEN)
+    first_record = generated.iloc[0].to_dict()
+    first_record["batch_date"] = first_record["batch_date"].isoformat()
+    fake.fact_rows.append(first_record)
+
+    summary = build_and_load_currency_fact(
+        batch_date=BATCH_DATE,
+        bigquery_adapter=fake,
+        fact_created_at=WHEN,
+    )
+
+    assert summary.fact_inserted_rows == 1
+    assert summary.fact_partition_rows == 2
+    assert summary.reconciled is True
+
+
+class MismatchedCountFake(StatefulFactFake):
+    def query_partition_row_count(
+        self, dataset_id, table_id, partition_field, partition_date
+    ):
+        count = super().query_partition_row_count(
+            dataset_id, table_id, partition_field, partition_date
+        )
+        if (dataset_id, table_id) == (
+            "bahtflow_analytics",
+            "fct_transactions",
+        ):
+            return count + 1
+        return count
+
+
+def test_persisted_fact_count_mismatch_fails():
+    fake = MismatchedCountFake()
+    with pytest.raises(
+        CurrencyFactLoadError,
+        match="Persisted currency fact reconciliation failed",
+    ):
+        build_and_load_currency_fact(
+            batch_date=BATCH_DATE,
+            bigquery_adapter=fake,
+            fact_created_at=WHEN,
+        )
 ```
 
-- [ ] **Step 2: Run and observe RED**
-
-Run:
+- [ ] **Step 2: Run persistence tests and observe RED**
 
 ```powershell
-pytest tests/pipeline/test_currency_fact_load.py::test_first_run_builds_fact_and_rerun_inserts_zero -v
+pytest tests/pipeline/test_currency_fact_load.py -v
 ```
 
 Expected: collection/import failure because `pipeline.currency_fact_load` does not exist.
 
-- [ ] **Step 3: Implement the minimal loader and summary**
+- [ ] **Step 3: Implement the complete one-batch loader**
 
-Create `pipeline/currency_fact_load.py` with:
+Create `pipeline/currency_fact_load.py`:
 
 ```python
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
+
+import pandas as pd
+
+from pipeline.bigquery_contract import (
+    ACCEPTED_DATASET_ID,
+    ACCEPTED_TABLE_ID,
+    ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
+    FACT_DATASET_ID,
+    FACT_TABLE_ID,
+    FACT_TRANSACTIONS_PARTITION_FIELD,
+    FACT_TRANSACTIONS_SCHEMA,
+)
+from pipeline.currency_fact import ACCEPTED_INPUT_COLUMNS, build_currency_fact
+from pipeline.fx_resolution import RAW_FX_COLUMNS, resolve_effective_fx
+from pipeline.pandas_intake import anti_filter_existing
 
 
 class CurrencyFactLoadError(RuntimeError):
@@ -1012,74 +1398,122 @@ class CurrencyFactLoadSummary:
     accepted_partition_rows: int
     fact_partition_rows: int
     reconciled: bool
-```
 
-`build_and_load_currency_fact` must:
 
-1. read `transactions_accepted` only for the target `batch_date` using `ACCEPTED_INPUT_COLUMNS`;
-2. read `bahtflow_raw.fx_rates` through the target date using `RAW_FX_COLUMNS` and `query_rows_through_date`;
-3. resolve the FX snapshot;
-4. build the complete fact DataFrame;
-5. query existing fact IDs for the target partition;
-6. use existing `pipeline.pandas_intake.anti_filter_existing` on `source_row_id`;
-7. serialize Decimals as strings, dates/datetimes as ISO text, lists as lists, and Pandas missing values as `None`, following the proven Feature 05 `_frame_to_records` pattern;
-8. append unseen rows with `FACT_TRANSACTIONS_SCHEMA`;
-9. query accepted and fact partition counts;
-10. fail unless those persisted counts are equal.
+def _json_safe_value(value):
+    if isinstance(value, list):
+        return list(value)
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime().isoformat()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
 
-Use `datetime.now(timezone.utc)` only when `fact_created_at` is not supplied.
 
-- [ ] **Step 4: Run first-run/rerun test and observe GREEN**
+def _frame_to_records(frame: pd.DataFrame) -> list[dict]:
+    return [
+        {key: _json_safe_value(value) for key, value in record.items()}
+        for record in frame.to_dict(orient="records")
+    ]
 
-Run the targeted test from Step 2. Expected: PASS.
 
-- [ ] **Step 5: Add RED partial-retry and persisted-mismatch tests**
+def build_and_load_currency_fact(
+    *,
+    batch_date: date,
+    bigquery_adapter,
+    fact_created_at: datetime | None = None,
+) -> CurrencyFactLoadSummary:
+    invocation_time = fact_created_at or datetime.now(timezone.utc)
+    accepted_rows = bigquery_adapter.query_partition_rows(
+        ACCEPTED_DATASET_ID,
+        ACCEPTED_TABLE_ID,
+        ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
+        batch_date,
+        ACCEPTED_INPUT_COLUMNS,
+    )
+    accepted_frame = pd.DataFrame(
+        accepted_rows,
+        columns=list(ACCEPTED_INPUT_COLUMNS),
+    )
+    fx_rows = bigquery_adapter.query_rows_through_date(
+        "bahtflow_raw",
+        "fx_rates",
+        "rate_date",
+        batch_date,
+        RAW_FX_COLUMNS,
+    )
+    fx_frame = pd.DataFrame(fx_rows, columns=list(RAW_FX_COLUMNS))
+    snapshot = resolve_effective_fx(fx_frame, batch_date)
+    fact = build_currency_fact(
+        accepted_frame,
+        batch_date,
+        snapshot,
+        invocation_time,
+    )
 
-Add a test that pre-populates the fake fact output with exactly one of the two deterministic generated fact rows, then calls `build_and_load_currency_fact` and asserts only one row is inserted and the final partition has two rows.
+    existing_ids = bigquery_adapter.query_source_row_ids(
+        FACT_DATASET_ID,
+        FACT_TABLE_ID,
+        FACT_TRANSACTIONS_PARTITION_FIELD,
+        batch_date,
+    )
+    fact_new = anti_filter_existing(fact, existing_ids)
+    inserted = bigquery_adapter.append_rows(
+        FACT_DATASET_ID,
+        FACT_TABLE_ID,
+        _frame_to_records(fact_new),
+        FACT_TRANSACTIONS_SCHEMA,
+    )
 
-Add a `MismatchedCountFake` whose fact partition count reports one extra row and assert:
+    accepted_partition_rows = bigquery_adapter.query_partition_row_count(
+        ACCEPTED_DATASET_ID,
+        ACCEPTED_TABLE_ID,
+        ACCEPTED_TRANSACTIONS_PARTITION_FIELD,
+        batch_date,
+    )
+    fact_partition_rows = bigquery_adapter.query_partition_row_count(
+        FACT_DATASET_ID,
+        FACT_TABLE_ID,
+        FACT_TRANSACTIONS_PARTITION_FIELD,
+        batch_date,
+    )
+    reconciled = accepted_partition_rows == fact_partition_rows
+    if not reconciled:
+        raise CurrencyFactLoadError(
+            "Persisted currency fact reconciliation failed: "
+            f"accepted={accepted_partition_rows} fact={fact_partition_rows}"
+        )
 
-```python
-with pytest.raises(CurrencyFactLoadError, match="Persisted currency fact reconciliation failed"):
-    build_and_load_currency_fact(...)
-```
-
-- [ ] **Step 6: Run persistence suite and observe RED if retry/count handling is incomplete**
-
-Run:
-
-```powershell
-pytest tests/pipeline/test_currency_fact_load.py -v
-```
-
-Expected: edge-case failures until the loader handles pre-existing IDs and persisted reconciliation exactly.
-
-- [ ] **Step 7: Complete retry and reconciliation behavior**
-
-Make the persisted invariant explicit:
-
-```python
-reconciled = accepted_partition_rows == fact_partition_rows
-if not reconciled:
-    raise CurrencyFactLoadError(
-        "Persisted currency fact reconciliation failed: "
-        f"accepted={accepted_partition_rows} fact={fact_partition_rows}"
+    return CurrencyFactLoadSummary(
+        batch_date=batch_date.isoformat(),
+        accepted_rows=len(accepted_frame),
+        fx_rate_date=snapshot.fx_rate_date.isoformat(),
+        is_carried_forward=snapshot.is_carried_forward,
+        staleness_days=snapshot.staleness_days,
+        fact_rows=len(fact),
+        fact_inserted_rows=inserted,
+        accepted_partition_rows=accepted_partition_rows,
+        fact_partition_rows=fact_partition_rows,
+        reconciled=True,
     )
 ```
 
-Do not add rollback, delete, merge, replacement, or source/reference rewrite behavior.
-
-- [ ] **Step 8: Run F06 pipeline suites**
-
-Run:
+- [ ] **Step 4: Run persistence + upstream F06 suites**
 
 ```powershell
 pytest tests/pipeline/test_bigquery_numeric.py tests/pipeline/test_fx_resolution.py tests/pipeline/test_currency_fact.py tests/pipeline/test_currency_fact_load.py -v
 ```
 
-Expected: all selected tests PASS.
+Expected: all selected tests PASS, including first run, unchanged rerun, pre-populated partial retry, and persisted mismatch failure.
 
-- [ ] **Step 9: Commit Task 6**
+- [ ] **Step 5: Commit Task 6**
 
 ```powershell
 git add pipeline/currency_fact_load.py tests/pipeline/test_currency_fact_load.py
@@ -1100,28 +1534,46 @@ git commit -m "feat: persist idempotent currency facts"
 
 - [ ] **Step 1: Write the failing CLI contract test**
 
-Create `tests/scripts/test_build_currency_fact.py` using monkeypatch to replace `run_currency_fact` with a deterministic summary. Assert required `--batch-date` parsing and exact output field order:
+Create `tests/scripts/test_build_currency_fact.py`:
 
 ```python
-fields = (
-    "batch_date",
-    "accepted_rows",
-    "fx_rate_date",
-    "is_carried_forward",
-    "staleness_days",
-    "fact_rows",
-    "fact_inserted_rows",
-    "accepted_partition_rows",
-    "fact_partition_rows",
-    "reconciled",
-)
+from types import SimpleNamespace
+
+import scripts.build_currency_fact as cli
+
+
+def test_main_prints_currency_fact_summary_in_stable_order(monkeypatch, capsys):
+    summary = SimpleNamespace(
+        batch_date="2025-07-22",
+        accepted_rows=2,
+        fx_rate_date="2025-07-21",
+        is_carried_forward=True,
+        staleness_days=1,
+        fact_rows=2,
+        fact_inserted_rows=2,
+        accepted_partition_rows=2,
+        fact_partition_rows=2,
+        reconciled=True,
+    )
+    monkeypatch.setattr(cli, "run_currency_fact", lambda batch_date: summary)
+
+    cli.main(["--batch-date", "2025-07-22"])
+
+    assert capsys.readouterr().out.splitlines() == [
+        "batch_date=2025-07-22",
+        "accepted_rows=2",
+        "fx_rate_date=2025-07-21",
+        "is_carried_forward=True",
+        "staleness_days=1",
+        "fact_rows=2",
+        "fact_inserted_rows=2",
+        "accepted_partition_rows=2",
+        "fact_partition_rows=2",
+        "reconciled=True",
+    ]
 ```
 
-Use a fake summary with `batch_date="2025-07-22"`, `accepted_rows=2`, `fx_rate_date="2025-07-21"`, `is_carried_forward=True`, `staleness_days=1`, `fact_rows=2`, `fact_inserted_rows=2`, `accepted_partition_rows=2`, `fact_partition_rows=2`, `reconciled=True` and assert those ten lines are printed in that order.
-
-- [ ] **Step 2: Run and observe RED**
-
-Run:
+- [ ] **Step 2: Run CLI test and observe RED**
 
 ```powershell
 pytest tests/scripts/test_build_currency_fact.py -v
@@ -1129,7 +1581,7 @@ pytest tests/scripts/test_build_currency_fact.py -v
 
 Expected: collection/import failure because `scripts.build_currency_fact` does not exist.
 
-- [ ] **Step 3: Implement CLI following the F05 pattern**
+- [ ] **Step 3: Implement the CLI**
 
 Create `scripts/build_currency_fact.py`:
 
@@ -1184,9 +1636,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Run CLI test and focused F06 gate**
-
-Run:
+- [ ] **Step 4: Run CLI and focused F06 tests**
 
 ```powershell
 pytest tests/scripts/test_build_currency_fact.py tests/scripts/test_bootstrap_currency_fact.py tests/pipeline/test_bigquery_numeric.py tests/pipeline/test_fx_resolution.py tests/pipeline/test_currency_fact.py tests/pipeline/test_currency_fact_load.py -v
@@ -1210,10 +1660,10 @@ git commit -m "feat: add currency fact CLI"
 - No production behavior change unless live verification exposes a bug; any bug fix must stop this task and return to systematic-debugging + TDD before changing code.
 
 **Interfaces:**
-- Consumes: all completed F06 code and the existing live GCP project.
-- Produces: measured acceptance evidence, documented F06 runbook, clean final diff ready for integration.
+- Consumes: completed F06 code and the existing live GCP project.
+- Produces: measured acceptance evidence, documented F06 runbook, and a clean feature diff ready for the finishing workflow.
 
-- [ ] **Step 1: Switch local checkout to the F06 branch and run the full local gate**
+- [ ] **Step 1: Switch local checkout to F06 and run the complete local gate**
 
 ```powershell
 git switch feat/06-fx-currency-fact
@@ -1236,7 +1686,7 @@ git status --short
 git ls-files | Select-String -Pattern 'application_default_credentials|service-account|\.pem$|\.key$'
 ```
 
-Required: pytest has zero failures; compile/config/diff/status/credential checks are clean/quiet.
+Required: pytest has zero failures; compile/config/diff/status/credential checks are clean or quiet.
 
 - [ ] **Step 2: Build the GCP toolbox**
 
@@ -1256,11 +1706,9 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.bootstrap_currency_fact
 ```
 
-Required: fresh project/table state reports `created` on first creation when absent; second run reports `verified`. If the table already exists from an earlier acceptance attempt, `verified` is acceptable on both runs.
+Required: when absent, the first run reports `table=bahtflow_analytics.fct_transactions status=created`; the second reports `status=verified`. If the table already exists from a prior acceptance attempt, `verified` on both runs is acceptable.
 
-- [ ] **Step 4: Record primary acceptance pre-state for `2025-07-22`**
-
-Use a stdin Python script to avoid PowerShell quoting problems:
+- [ ] **Step 4: Record the primary acceptance pre-state for `2025-07-22`**
 
 ```powershell
 @'
@@ -1279,9 +1727,9 @@ print("latest_fx_rows=", [tuple(r) for r in fx])
 '@ | docker compose --profile gcp run --rm -T gcp-toolbox python -
 ```
 
-Required primary source evidence: `accepted_before=8803`. Do not proceed with a first-run insertion expectation until the actual `fact_before` state is known. If `fact_before` is nonzero from an earlier run, treat the next run as idempotency/recovery evidence rather than pretending it is a fresh first run.
+Required source evidence: `accepted_before=8803`. Record `fact_before` and latest raw FX rows exactly as observed. If `fact_before` is nonzero, do not claim the next run is a fresh first run.
 
-- [ ] **Step 5: Run the primary live currency-fact batch**
+- [ ] **Step 5: Execute the primary live currency-fact batch**
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
@@ -1300,7 +1748,7 @@ fx_rate_date <= 2025-07-22
 staleness_days >= 0
 ```
 
-If Step 4 proved `fact_before=0`, also require `fact_inserted_rows=8803`. Otherwise require only that inserted count equals the number of previously missing fact `source_row_id` values; do not fabricate a first-run claim.
+If Step 4 showed `fact_before=0`, require `fact_inserted_rows=8803`. If rows already existed, require only the measured number of missing IDs to be inserted.
 
 - [ ] **Step 6: Rerun the exact same command for idempotency evidence**
 
@@ -1317,9 +1765,9 @@ fact_partition_rows=8803
 reconciled=True
 ```
 
-and the FX lineage fields must remain deterministic for the same immutable inputs.
+The effective FX date/rates/staleness must be deterministic for the same immutable inputs.
 
-- [ ] **Step 7: Inspect live THB/USD/EUR fact samples and source-row set equality**
+- [ ] **Step 7: Inspect one THB, USD, and EUR fact row plus source-row set equality**
 
 ```powershell
 @'
@@ -1339,8 +1787,15 @@ ORDER BY source_file, source_row_number
 LIMIT 1
 """
 for currency in ("THB", "USD", "EUR"):
-    cfg = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("currency", "STRING", currency)])
-    print(currency.lower()+"_sample=", [tuple(r) for r in c.query(sample_sql, job_config=cfg).result()])
+    cfg = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("currency", "STRING", currency)
+        ]
+    )
+    print(
+        currency.lower() + "_sample=",
+        [tuple(row) for row in c.query(sample_sql, job_config=cfg).result()],
+    )
 set_diff_sql = f"""
 SELECT COUNT(*) FROM (
   (SELECT source_row_id FROM `{base}.bahtflow_analytics.transactions_accepted` WHERE batch_date=DATE('2025-07-22')
@@ -1352,36 +1807,54 @@ SELECT COUNT(*) FROM (
    SELECT source_row_id FROM `{base}.bahtflow_analytics.transactions_accepted` WHERE batch_date=DATE('2025-07-22'))
 )
 """
-print("source_row_id_set_difference=", next(iter(c.query(set_diff_sql).result()))[0])
+print(
+    "source_row_id_set_difference=",
+    next(iter(c.query(set_diff_sql).result()))[0],
+)
 '@ | docker compose --profile gcp run --rm -T gcp-toolbox python -
 ```
 
-Required: each currency sample exists; converted values and FX lineage are populated; `source_row_id_set_difference=0`.
+Required: all three currency samples exist; converted amounts and FX lineage are populated; `source_row_id_set_difference=0`.
 
-- [ ] **Step 8: Optional live carry-forward demonstration only if current raw + accepted state already supports it**
+- [ ] **Step 8: Attempt optional live carry-forward evidence without expanding scope**
 
-Query for a date that has accepted rows but no same-day FX and a prior FX publication. If such a date is already loaded in both accepted/raw FX state, run `scripts.build_currency_fact` for it and require `is_carried_forward=True` and `staleness_days>0`. If no such currently-loaded date exists, record that carry-forward is proven by unit tests and defer end-to-end historical demonstration to F07; do not load extra historical batches merely to satisfy F06.
+Use this discovery query only against already-loaded accepted/raw FX state:
 
-- [ ] **Step 9: Update README with measured F06 runbook/evidence**
+```powershell
+@'
+from pipeline.config import load_gcp_settings
+from google.cloud import bigquery
 
-Add `## Feature 06: FX + Currency Fact` after the F05 section. Document:
+s = load_gcp_settings()
+c = bigquery.Client(project=s.project_id)
+base = s.project_id
+sql = f"""
+WITH accepted_dates AS (
+  SELECT DISTINCT batch_date
+  FROM `{base}.bahtflow_analytics.transactions_accepted`
+),
+fx_dates AS (
+  SELECT DISTINCT rate_date
+  FROM `{base}.bahtflow_raw.fx_rates`
+)
+SELECT a.batch_date
+FROM accepted_dates a
+LEFT JOIN fx_dates f ON f.rate_date = a.batch_date
+WHERE f.rate_date IS NULL
+ORDER BY a.batch_date
+LIMIT 5
+"""
+print("carry_forward_candidates=", [row[0] for row in c.query(sql).result()])
+'@ | docker compose --profile gcp run --rm -T gcp-toolbox python -
+```
 
-- bootstrap command;
-- one-batch command;
-- latest-published `rate_date <= batch_date` semantics;
-- exact USD/EUR pair requirement;
-- no fallback from malformed latest publication;
-- Decimal / BigQuery NUMERIC scale-9 normalization;
-- THB bridge conversion;
-- FX lineage fields;
-- append-only `source_row_id` idempotency;
-- measured primary acceptance counts/rates/staleness from Steps 4-7;
-- rerun inserted zero;
-- carry-forward live evidence only if actually executed, otherwise say unit tests cover carry-forward and F07 will demonstrate it historically.
+If a candidate exists and its prior raw FX pair is already loaded, run the F06 CLI for that date and require `is_carried_forward=True`, `staleness_days>0`, and reconciliation. If no candidate exists, record unit-test carry-forward evidence and defer historical end-to-end proof to F07. Do not load extra historical accepted batches solely for F06.
 
-Do not document guessed rate values or claims not observed in this run.
+- [ ] **Step 9: Update README with only measured F06 evidence**
 
-- [ ] **Step 10: Commit README**
+Add `## Feature 06: FX + Currency Fact` after Feature 05. Include the two CLI commands, latest-published semantics, exact USD/EUR-pair validation, no fallback from a malformed latest publication, Decimal/NUMERIC scale-9 policy, THB-bridge formulas, FX lineage fields, append-only `source_row_id` idempotency, measured `2025-07-22` acceptance evidence, and rerun-zero evidence. Include live carry-forward claims only if Step 8 was actually executed successfully.
+
+- [ ] **Step 10: Commit and push the README evidence**
 
 ```powershell
 git add README.md
@@ -1391,27 +1864,25 @@ git push origin feat/06-fx-currency-fact
 
 - [ ] **Step 11: Run the fresh final local gate after the README commit**
 
-Repeat the complete Step 1 verification commands. Required: fresh zero-failure/clean evidence.
+Repeat every command in Step 1. Required: fresh zero-failure/clean evidence.
 
 - [ ] **Step 12: Review `main...feat/06-fx-currency-fact` before finishing**
-
-Run:
 
 ```powershell
 git diff --stat main...feat/06-fx-currency-fact
 git diff --check main...feat/06-fx-currency-fact
 ```
 
-Also review changed production files against these rejection criteria:
+Reject the feature if review finds any of these:
 
-- reject BigQuery SQL containing `MAX(rate_date)`, business currency filters used to choose the snapshot, arithmetic conversion, or FX fallback logic;
-- reject any `float` conversion path;
-- reject future FX selection;
-- reject fallback from malformed latest publication to an older valid publication;
-- reject `MERGE`, truncate, replace, delete, or cross-partition destructive writes;
-- reject a persisted `fx_effective_daily` table;
-- reject second-stage transaction quarantine;
-- reject F07 Airflow DAG wiring or F08 mart/publication scope;
-- reject documentation claims that were not measured.
+- BigQuery SQL containing `MAX(rate_date)`, business currency selection, conversion arithmetic, or FX fallback logic;
+- any `float` conversion path;
+- future FX selection;
+- fallback from a malformed latest publication to an older valid publication;
+- `MERGE`, truncate, replace, delete, or cross-partition destructive writes;
+- a persisted `fx_effective_daily` table;
+- second-stage transaction quarantine;
+- F07 Airflow DAG wiring or F08 mart/publication scope;
+- documentation claims not supported by executed evidence.
 
-Only after live evidence, the fresh final gate, and diff review are clean should the feature enter `superpowers:finishing-a-development-branch` for the user's integration choice. Preserve the feature branch after local merge if the user repeats the established preference to keep all feature branches until the project is finished.
+Only after live evidence, the fresh final gate, and diff review are clean should the feature enter `superpowers:finishing-a-development-branch` for the user's integration choice. Preserve the feature branch after local merge because the user has already established the preference to keep feature branches until all features are finished.
