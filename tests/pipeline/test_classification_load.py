@@ -157,6 +157,33 @@ def test_first_run_classifies_and_rerun_inserts_zero(raw_rows_fixture):
     assert second.reconciled is True
 
 
+def test_partial_retry_skips_persisted_accepted_and_writes_missing_quarantine(
+    raw_rows_fixture,
+):
+    fake = StatefulBigQueryFake(raw_rows_fixture)
+    fake.fail_next_quarantine_append = True
+
+    with pytest.raises(RuntimeError, match="simulated quarantine write failure"):
+        classify_and_load_batch(
+            batch_date=date(2025, 7, 22),
+            bigquery_adapter=fake,
+            classified_at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+        )
+
+    assert len(fake.outputs[("bahtflow_analytics", "transactions_accepted")]) == 2
+    assert len(fake.outputs[("bahtflow_ops", "transactions_quarantine")]) == 0
+
+    retry = classify_and_load_batch(
+        batch_date=date(2025, 7, 22),
+        bigquery_adapter=fake,
+        classified_at=datetime(2026, 9, 2, 8, 5, tzinfo=timezone.utc),
+    )
+
+    assert retry.accepted_inserted_rows == 0
+    assert retry.quarantine_inserted_rows == 2
+    assert retry.reconciled is True
+
+
 class MismatchedCountFake(StatefulBigQueryFake):
     def query_partition_row_count(
         self,
