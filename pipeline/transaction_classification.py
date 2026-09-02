@@ -295,8 +295,16 @@ def classify_transactions(
         if quarantine_parts
         else pd.DataFrame(columns=list(QUARANTINE_COLUMNS))
     )
+    accepted = _project_accepted(accepted_source, classified_at)
+
+    if len(raw_df) != len(accepted) + len(quarantine):
+        raise TransactionClassificationError(
+            "Classification reconciliation failed: "
+            f"raw={len(raw_df)} accepted={len(accepted)} "
+            f"quarantine={len(quarantine)}"
+        )
 
     return ClassificationResult(
-        accepted=_project_accepted(accepted_source, classified_at),
+        accepted=accepted,
         quarantine=quarantine,
     )
