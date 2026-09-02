@@ -1,5 +1,8 @@
 x-airflow-common: &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.1-python3.12}
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: ${BAHTFLOW_AIRFLOW_IMAGE_NAME:-bahtflow-airflow:3.3.1}
   user: "${AIRFLOW_UID:-50000}:0"
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -9,13 +12,24 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
     AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Bangkok
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/bahtflow/airflow/dags
     AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_API_PORT:-8080}
     AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    BAHTFLOW_GCP_PROJECT: ${BAHTFLOW_GCP_PROJECT}
+    BAHTFLOW_GCS_BUCKET: ${BAHTFLOW_GCS_BUCKET}
+    BAHTFLOW_GCP_LOCATION: ${BAHTFLOW_GCP_LOCATION}
+    BAHTFLOW_RUNTIME_SERVICE_ACCOUNT: ${BAHTFLOW_RUNTIME_SERVICE_ACCOUNT}
+    GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/application_default_credentials.json
+    PYTHONPATH: /opt/bahtflow
   volumes:
-    - ./airflow/dags:/opt/airflow/dags
+    - ./:/opt/bahtflow
     - ./airflow/logs:/opt/airflow/logs
+    - type: bind
+      source: ${GOOGLE_ADC_HOST_PATH}
+      target: /var/secrets/google/application_default_credentials.json
+      read_only: true
   networks:
     - bahtflow
 
