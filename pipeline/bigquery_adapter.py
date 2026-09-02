@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
@@ -76,4 +78,71 @@ class BigQueryAdapter:
 
     def query_scalar(self, sql: str) -> int:
         rows = self._client.query(sql).result()
+        return int(next(iter(rows))[0])
+
+    def _partition_job_config(self, partition_date: date):
+        return bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "partition_date", "DATE", partition_date
+                )
+            ]
+        )
+
+    def query_source_row_ids(
+        self,
+        dataset_id: str,
+        table_id: str,
+        partition_field: str,
+        partition_date: date,
+    ) -> set[str]:
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        sql = (
+            f"SELECT source_row_id FROM `{full_id}` "
+            f"WHERE {partition_field} = @partition_date"
+        )
+        rows = self._client.query(
+            sql,
+            job_config=self._partition_job_config(partition_date),
+        ).result()
+        return {str(row[0]) for row in rows}
+
+    def append_rows(
+        self,
+        dataset_id: str,
+        table_id: str,
+        rows: list[dict],
+        schema,
+    ) -> int:
+        if not rows:
+            return 0
+
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        job_config = bigquery.LoadJobConfig(
+            schema=list(schema),
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        self._client.load_table_from_json(
+            rows,
+            full_id,
+            job_config=job_config,
+        ).result()
+        return len(rows)
+
+    def query_partition_row_count(
+        self,
+        dataset_id: str,
+        table_id: str,
+        partition_field: str,
+        partition_date: date,
+    ) -> int:
+        full_id = f"{self._project_id}.{dataset_id}.{table_id}"
+        sql = (
+            f"SELECT COUNT(*) FROM `{full_id}` "
+            f"WHERE {partition_field} = @partition_date"
+        )
+        rows = self._client.query(
+            sql,
+            job_config=self._partition_job_config(partition_date),
+        ).result()
         return int(next(iter(rows))[0])
