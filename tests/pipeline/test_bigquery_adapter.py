@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
@@ -6,11 +8,16 @@ from pipeline.bigquery_adapter import BigQueryAdapter, BigQueryContractError
 
 
 class FakeQueryJob:
-    def __init__(self, value):
-        self._value = value
+    def __init__(self, rows):
+        self._rows = rows
 
     def result(self):
-        return [(self._value,)]
+        return self._rows
+
+
+class FakeLoadJob:
+    def result(self):
+        return self
 
 
 class FakeClient:
@@ -18,6 +25,9 @@ class FakeClient:
         self.datasets = {}
         self.tables = {}
         self.query_value = 0
+        self.query_rows = None
+        self.query_calls = []
+        self.load_calls = []
 
     def get_dataset(self, full_id):
         if full_id not in self.datasets:
@@ -39,8 +49,14 @@ class FakeClient:
         self.tables[f"{ref.project}.{ref.dataset_id}.{ref.table_id}"] = table
         return table
 
-    def query(self, sql):
-        return FakeQueryJob(self.query_value)
+    def query(self, sql, job_config=None):
+        self.query_calls.append((sql, job_config))
+        rows = self.query_rows if self.query_rows is not None else [(self.query_value,)]
+        return FakeQueryJob(rows)
+
+    def load_table_from_json(self, rows, destination, job_config=None):
+        self.load_calls.append((rows, destination, job_config))
+        return FakeLoadJob()
 
 
 def test_missing_dataset_is_created_in_expected_location():
@@ -166,3 +182,63 @@ def test_query_scalar_returns_first_value_as_int():
     adapter = BigQueryAdapter("proj", client=client)
 
     assert adapter.query_scalar("SELECT 17") == 17
+
+
+def test_query_source_row_ids_is_partition_scoped():
+    client = FakeClient()
+    client.query_rows = [("id-a",), ("id-b",)]
+    adapter = BigQueryAdapter("proj", client=client)
+
+    result = adapter.query_source_row_ids(
+        "bahtflow_raw", "transactions", "batch_date", date(2025, 7, 22)
+    )
+
+    assert result == {"id-a", "id-b"}
+    sql, job_config = client.query_calls[-1]
+    assert "`proj.bahtflow_raw.transactions`" in sql
+    assert "WHERE batch_date = @partition_date" in sql
+    parameter = job_config.query_parameters[0]
+    assert parameter.name == "partition_date"
+    assert parameter.type_ == "DATE"
+    assert parameter.value == date(2025, 7, 22)
+
+
+def test_append_rows_uses_write_append_load_job():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+    schema = (bigquery.SchemaField("source_row_id", "STRING", mode="REQUIRED"),)
+    rows = [{"source_row_id": "id-a"}, {"source_row_id": "id-b"}]
+
+    assert adapter.append_rows("bahtflow_raw", "transactions", rows, schema) == 2
+
+    loaded_rows, destination, job_config = client.load_calls[-1]
+    assert loaded_rows == rows
+    assert destination == "proj.bahtflow_raw.transactions"
+    assert job_config.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+    assert [(f.name, f.field_type, f.mode) for f in job_config.schema] == [
+        ("source_row_id", "STRING", "REQUIRED")
+    ]
+
+
+def test_append_rows_skips_empty_input():
+    client = FakeClient()
+    adapter = BigQueryAdapter("proj", client=client)
+
+    assert adapter.append_rows("bahtflow_raw", "transactions", [], ()) == 0
+    assert client.load_calls == []
+
+
+def test_query_partition_row_count_is_partition_scoped():
+    client = FakeClient()
+    client.query_rows = [(8978,)]
+    adapter = BigQueryAdapter("proj", client=client)
+
+    count = adapter.query_partition_row_count(
+        "bahtflow_raw", "transactions", "batch_date", date(2025, 7, 22)
+    )
+
+    assert count == 8978
+    sql, job_config = client.query_calls[-1]
+    assert "SELECT COUNT(*)" in sql
+    assert "WHERE batch_date = @partition_date" in sql
+    assert job_config.query_parameters[0].value == date(2025, 7, 22)
