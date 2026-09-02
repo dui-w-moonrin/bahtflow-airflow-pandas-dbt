@@ -4,13 +4,10 @@ import gzip
 import hashlib
 from datetime import date, datetime, timezone
 
+from pipeline import raw_load
 from pipeline.gcs_adapter import ObjectMetadata
 from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY
-from pipeline.raw_load import (
-    load_fx_raw_batch,
-    load_raw_batch,
-    load_transaction_raw_batch,
-)
+from pipeline.raw_load import load_raw_batch
 
 
 def _sha256(data: bytes) -> str:
@@ -149,7 +146,7 @@ def test_transaction_raw_loader_does_not_require_same_day_fx():
     del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
     bq = FakeBigQueryAdapter()
 
-    summary = load_transaction_raw_batch(
+    summary = raw_load.load_transaction_raw_batch(
         batch_date=d,
         bucket_name="bucket",
         gcs_adapter=FakeGcsAdapter(objects),
@@ -171,7 +168,7 @@ def test_fx_raw_loader_returns_no_new_rate_without_touching_transactions():
     del objects[f"fx/{d:%Y}/{d:%m}/fx_{d:%Y%m%d}.csv"]
     bq = FakeBigQueryAdapter()
 
-    summary = load_fx_raw_batch(
+    summary = raw_load.load_fx_raw_batch(
         batch_date=d,
         bucket_name="bucket",
         gcs_adapter=FakeGcsAdapter(objects),
