@@ -196,17 +196,16 @@ def _project_accepted(valid_df: pd.DataFrame, classified_at: datetime) -> pd.Dat
     ).reset_index(drop=True)
 
 
-def _project_replay_quarantine(
-    replay_df: pd.DataFrame,
+def _project_quarantine(
+    frame: pd.DataFrame,
+    reason_codes: list[list[str]],
     classified_at: datetime,
 ) -> pd.DataFrame:
-    if replay_df.empty:
+    if frame.empty:
         return pd.DataFrame(columns=list(QUARANTINE_COLUMNS))
 
-    quarantine = replay_df.loc[:, list(RAW_TRANSACTION_COLUMNS)].copy()
-    quarantine["reason_codes"] = [
-        ["DUPLICATE_REPLAY"] for _ in range(len(quarantine))
-    ]
+    quarantine = frame.loc[:, list(RAW_TRANSACTION_COLUMNS)].copy()
+    quarantine["reason_codes"] = reason_codes
     quarantine["quarantined_at"] = classified_at
     return quarantine.loc[:, list(QUARANTINE_COLUMNS)].reset_index(drop=True)
 
@@ -217,34 +216,81 @@ def classify_transactions(
     classified_at: datetime,
 ) -> ClassificationResult:
     validated = validate_and_canonicalize_transactions(raw_df, batch_date)
+    base_invalid = validated[
+        validated["_base_reason_codes"].map(len).gt(0)
+    ].copy()
     valid = validated[
         validated["_base_reason_codes"].map(len).eq(0)
     ].copy()
 
     accepted_parts: list[pd.DataFrame] = []
-    replay_parts: list[pd.DataFrame] = []
+    duplicate_quarantine_parts: list[pd.DataFrame] = []
+    duplicate_reason_parts: list[list[list[str]]] = []
 
     for _txn, group in valid.groupby("_txn_canonical", sort=False):
         ordered = group.sort_values(
             ["source_file", "source_row_number"],
             kind="stable",
         )
+        payloads = set(
+            zip(
+                ordered["_transaction_dt"],
+                ordered["_amount_numeric"],
+                ordered["_currency_canonical"],
+                ordered["region"],
+            )
+        )
+
+        if len(payloads) > 1:
+            duplicate_quarantine_parts.append(ordered)
+            duplicate_reason_parts.append(
+                [["DUPLICATE_CONFLICT"] for _ in range(len(ordered))]
+            )
+            continue
+
         accepted_parts.append(ordered.iloc[[0]])
         if len(ordered) > 1:
-            replay_parts.append(ordered.iloc[1:])
+            replay = ordered.iloc[1:]
+            duplicate_quarantine_parts.append(replay)
+            duplicate_reason_parts.append(
+                [["DUPLICATE_REPLAY"] for _ in range(len(replay))]
+            )
 
     accepted_source = (
         pd.concat(accepted_parts, ignore_index=False)
         if accepted_parts
         else valid.iloc[0:0].copy()
     )
-    replay_source = (
-        pd.concat(replay_parts, ignore_index=False)
-        if replay_parts
-        else valid.iloc[0:0].copy()
+
+    quarantine_parts: list[pd.DataFrame] = []
+    if not base_invalid.empty:
+        quarantine_parts.append(
+            _project_quarantine(
+                base_invalid,
+                base_invalid["_base_reason_codes"].tolist(),
+                classified_at,
+            )
+        )
+
+    for duplicate_frame, reason_codes in zip(
+        duplicate_quarantine_parts,
+        duplicate_reason_parts,
+    ):
+        quarantine_parts.append(
+            _project_quarantine(
+                duplicate_frame,
+                reason_codes,
+                classified_at,
+            )
+        )
+
+    quarantine = (
+        pd.concat(quarantine_parts, ignore_index=True)
+        if quarantine_parts
+        else pd.DataFrame(columns=list(QUARANTINE_COLUMNS))
     )
 
     return ClassificationResult(
         accepted=_project_accepted(accepted_source, classified_at),
-        quarantine=_project_replay_quarantine(replay_source, classified_at),
+        quarantine=quarantine,
     )
