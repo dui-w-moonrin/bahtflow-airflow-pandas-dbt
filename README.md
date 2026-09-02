@@ -6,7 +6,7 @@ BahtFlow is a production-minded batch ELT portfolio project for practising the d
 
 The repository contains a committed, reproducible source corpus: 360 daily batches across five regional sales feeds. It deliberately preserves duplicate transactions, conflicting records, and invalid values such as `N/A` so later stages can classify and quarantine them instead of silently discarding evidence.
 
-Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently. Feature 04 adds one-date Pandas intake and idempotent raw loading from GCS into those BigQuery raw tables. Feature 05 adds Pandas data-quality classification into typed accepted rows and auditable raw quarantine rows with deterministic batch-local duplicate handling and idempotent BigQuery persistence.
+Feature 01 provides the local Apache Airflow 3 orchestration runtime and a no-op `bahtflow_daily` DAG skeleton. Feature 02 provides credential-safe immutable GCS landing with ADC impersonation and SHA-256 conflict protection. Feature 03 adds the BigQuery warehouse boundary: four datasets plus two empty partitioned raw tables, created and verified idempotently. Feature 04 adds one-date Pandas intake and idempotent raw loading from GCS into those BigQuery raw tables. Feature 05 adds Pandas data-quality classification into typed accepted rows and auditable raw quarantine rows with deterministic batch-local duplicate handling and idempotent BigQuery persistence. Feature 06 resolves effective FX in Pandas, converts every accepted transaction into THB/USD/EUR, and persists an idempotent auditable transaction fact with FX lineage.
 
 Read the [data contract](data/README.md) for the source layout and validation manifest. The current v1 roadmap is in [the Pandas v1 design](docs/superpowers/specs/2026-09-02-pandas-v1-roadmap-design.md).
 
@@ -281,6 +281,81 @@ Live duplicate evidence for that batch showed one `DUPLICATE_REPLAY` transaction
 
 Feature 05 intentionally stops before effective-FX resolution and currency conversion (Feature 06) and before production Airflow wiring/backfill (Feature 07).
 
+## Feature 06: FX + Currency Fact
+
+Feature 06 reads one accepted transaction partition plus raw FX history at or before the same logical batch date. Pandas owns the business logic: it resolves the **latest published** FX date `<= batch_date`, requires that publication to be an exact USD/EUR pair, validates both positive rates, and fails if the newest publication is malformed rather than silently falling back to an older rate.
+
+Bootstrap or verify the fact table:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.bootstrap_currency_fact
+```
+
+Build one logical date:
+
+```powershell
+docker compose --profile gcp run --rm gcp-toolbox `
+  python -m scripts.build_currency_fact --batch-date 2025-07-22
+```
+
+The persisted target is:
+
+```text
+bahtflow_analytics.fct_transactions   DAY partitioned by batch_date
+```
+
+Each accepted row produces one fact row with the original `amount`/`currency`, converted `amount_thb`, `amount_usd`, `amount_eur`, and the exact effective-FX lineage used for the calculation:
+
+```text
+fx_rate_date
+usd_thb_rate
+eur_thb_rate
+is_carried_forward
+staleness_days
+```
+
+`mid_rate` semantics are THB per one foreign-currency unit. Conversion uses THB as the common bridge: THB rows retain their THB amount, USD rows multiply by the USD/THB rate, EUR rows multiply by the EUR/THB rate, and analytical USD/EUR outputs divide the THB amount by the corresponding rate. All arithmetic uses Python `Decimal`; `float` is not used. Derived values are normalized only as needed for BigQuery `NUMERIC` storage, with maximum scale 9 and `ROUND_HALF_EVEN`; report-level two-decimal rounding remains deferred to marts.
+
+Persistence reuses `source_row_id` as the fact idempotency key. Existing IDs are queried only for the target fact partition, Pandas anti-filters already persisted rows, and unseen rows are appended with `WRITE_APPEND`. There is no `MERGE`, replace, truncate, or delete path in v1.
+
+For the live acceptance batch `2025-07-22`, pre-state evidence measured `8,803` accepted rows and `0` fact rows. The effective publication was the same logical date with:
+
+```text
+USD/THB = 32.2722
+EUR/THB = 37.6978
+fx_rate_date = 2025-07-22
+is_carried_forward = False
+staleness_days = 0
+```
+
+The first Feature 06 run measured:
+
+```text
+accepted_rows=8803
+fact_rows=8803
+fact_inserted_rows=8803
+accepted_partition_rows=8803
+fact_partition_rows=8803
+reconciled=True
+```
+
+The immediate unchanged rerun measured `fact_inserted_rows=0` while both persisted partition counts remained `8,803` and reconciliation stayed true.
+
+Live audit samples demonstrated all three original currencies using the same effective snapshot. Example converted outputs included:
+
+```text
+THB  214.29 -> THB 214.29       USD 6.640080317   EUR 5.684416597
+USD    4.99 -> THB 161.038278   USD 4.99          EUR 4.271821645
+EUR   45.74 -> THB 1724.297372  USD 53.429805591  EUR 45.74
+```
+
+A bidirectional `EXCEPT DISTINCT` check between accepted and fact `source_row_id` sets returned `0`, proving one persisted fact row for every accepted source-row identity in the acceptance partition.
+
+Carry-forward behavior is covered by unit tests: same-day FX produces `False/0`, prior FX produces `True/>0`, and future FX is never selected. A historical end-to-end carry-forward demonstration is deferred to Feature 07, where logical-date backfill and prior-FX availability are orchestrated naturally rather than loading extra historical batches solely for Feature 06.
+
+Feature 06 intentionally stops before Airflow end-to-end/backfill orchestration (Feature 07) and marts/reconciliation/recovery publication work (Feature 08).
+
 ## Development checks
 
 ```powershell
@@ -293,11 +368,17 @@ python -m py_compile `
   pipeline/raw_load.py `
   pipeline/transaction_classification.py `
   pipeline/classification_load.py `
+  pipeline/bigquery_numeric.py `
+  pipeline/fx_resolution.py `
+  pipeline/currency_fact.py `
+  pipeline/currency_fact_load.py `
   scripts/bootstrap_bigquery.py `
   scripts/verify_bigquery_live.py `
   scripts/load_raw_batch.py `
   scripts/bootstrap_classification.py `
-  scripts/classify_transactions.py
+  scripts/classify_transactions.py `
+  scripts/bootstrap_currency_fact.py `
+  scripts/build_currency_fact.py
 
 docker compose config --quiet
 git diff --check
