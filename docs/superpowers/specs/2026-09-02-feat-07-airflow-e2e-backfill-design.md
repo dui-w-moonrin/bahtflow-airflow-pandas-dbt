@@ -48,17 +48,19 @@ The DAG is daily, uses `catchup=False`, and uses `max_active_runs=1` for v1. Ser
 
 ### 3. Logical date is the only batch-date source of truth
 
-Every task derives `batch_date` from the Airflow logical date in the `Asia/Bangkok` timezone. The DAG exposes no independent `batch_date` override parameter.
+`resolve_batch_date` derives the application batch date exactly once from the Airflow logical date converted to the `Asia/Bangkok` timezone. It returns only a small ISO date value suitable for XCom. Downstream task wrappers consume that resolved value and convert it to the existing `datetime.date` service contract.
 
-Scheduled runs, manual historical execution, and Airflow backfill therefore differ only in how Airflow creates the logical date. F04-F06 services always receive the same `datetime.date` contract.
+The DAG exposes no independent `batch_date` override parameter. No task may substitute a DAG param, environment date, wall-clock `today()`, or CLI-style batch-date value for the resolved logical date.
 
-This prevents a run from having one Airflow logical date and a conflicting application batch date.
+Scheduled runs and Airflow backfill therefore use the same application batch-date path. This prevents a run from having one Airflow logical date and a conflicting business batch date.
 
 ### 4. Explicit backfill, not automatic catchup
 
 Normal scheduling keeps `catchup=False`. Historical processing is deliberate and uses Airflow's backfill mechanism over a requested date range.
 
 F07 does not create a second backfill script or a special historical code path. Backfill invokes the same DAG tasks that a normal daily run invokes.
+
+Backfill for F07 must execute in forward chronological order, oldest logical date first. Backward/reverse ordering is not allowed because sparse FX history for a later business date may depend on a publication persisted by an earlier run.
 
 ### 5. F07 stops at the persisted fact
 
@@ -84,7 +86,7 @@ The following remain out of scope until F08/F09:
 
 Its responsibilities are limited to:
 
-- deriving the batch date from Airflow logical date
+- resolving the batch date from Airflow logical date
 - ordering tasks
 - constructing runtime adapters/settings
 - invoking pipeline services
@@ -167,9 +169,9 @@ Preflight must never create or alter datasets/tables. BigQuery bootstrap scripts
 
 Airflow's metadata database is not a data-processing transport. No Pandas `DataFrame`, source file bytes, accepted rows, quarantine rows, or fact rows may be passed through XCom.
 
-Each task persists its durable state to BigQuery and downstream tasks re-read the partition/history they own.
+Each processing task persists its durable state to BigQuery and downstream tasks re-read the partition/history they own.
 
-XCom/task return values are limited to small JSON-serializable summaries, for example:
+XCom/task return values are limited to small JSON-serializable values and summaries, including the resolved ISO batch date and observability fields such as:
 
 ```text
 load_tx_raw
@@ -203,7 +205,7 @@ build_currency_fact
   reconciled
 ```
 
-The summaries are observability evidence, not inputs required to rebuild the next task's data.
+The summaries are observability evidence, not inputs required to rebuild the next task's data. The resolved batch date is the only orchestration value that downstream processing tasks require from XCom.
 
 ## Failure Semantics
 
@@ -249,7 +251,7 @@ F07 does not add rollback or publish-state transitions. Those are F08 concerns.
 
 ## Historical Ordering and FX Carry-Forward
 
-The v1 DAG uses `max_active_runs=1`. Backfill is therefore executed as a serial set of logical-date runs.
+The v1 DAG uses `max_active_runs=1`, and F07 backfill is invoked in forward chronological order. Together these constraints guarantee that only one logical date is active at a time and earlier dates complete before later dates begin.
 
 This is important for the sparse FX source contract. A Friday publication must be persisted before Saturday/Sunday facts are built so that the downstream F06 resolver sees complete historical state.
 
@@ -280,7 +282,8 @@ No special weekend code exists in the DAG. Weekend behavior emerges from sparse 
 
 Tests must cover at least:
 
-- logical date converts to the expected `batch_date` under `Asia/Bangkok`
+- `resolve_batch_date` converts Airflow logical date to the expected date under `Asia/Bangkok`
+- downstream processing tasks use the resolved logical-date value and no independent batch-date override exists
 - DAG schedule remains daily
 - `catchup=False`
 - `max_active_runs=1`
@@ -317,7 +320,7 @@ Because this date was already processed before F07, this acceptance run is inten
 
 ### 4. Historical/backfill acceptance
 
-Use explicit Airflow backfill over `2025-07-25` through `2025-07-27`.
+Use explicit Airflow backfill over `2025-07-25` through `2025-07-27`, forward chronological order.
 
 All three dates must use the same TaskFlow DAG and pipeline functions as normal daily execution. No special script may process the backfill range.
 
@@ -360,8 +363,9 @@ F07 is complete only when all of the following are demonstrated with fresh evide
 
 3. **Explicit historical backfill uses the same code path**
    - backfill `2025-07-25` through `2025-07-27`
+   - forward chronological ordering
    - no special historical pipeline implementation
-   - serial run ordering
+   - serial run execution
 
 4. **Carry-forward is proven live**
    - Friday uses published same-day FX
