@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -10,6 +10,7 @@ from pipeline.pandas_intake import (
     EXPECTED_REGIONS,
     PandasIntakeError,
     make_source_row_id,
+    prepare_transaction_frame,
     same_day_fx_object_name,
     transaction_prefix,
     validate_transaction_objects,
@@ -105,3 +106,51 @@ def test_source_row_id_is_stable_and_row_number_sensitive():
     first = make_source_row_id(object_name, checksum, 1)
     assert first == make_source_row_id(object_name, checksum, 1)
     assert first != make_source_row_id(object_name, checksum, 2)
+
+
+def test_transaction_frame_enforces_exact_header():
+    d = date(2025, 7, 22)
+    source = _gzip_csv(
+        "txn,dtts,wrong,currency\nT1,2025-07-22 01:00:00,10,THB\n"
+    )
+
+    with pytest.raises(PandasIntakeError, match="Transaction header mismatch"):
+        prepare_transaction_frame(
+            source_bytes=source,
+            source_file=_tx_names(d)[0],
+            source_checksum=_sha256(source),
+            region="bkk",
+            batch_date=d,
+            ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+        )
+
+
+def test_transaction_frame_preserves_dirty_strings_and_metadata():
+    d = date(2025, 7, 22)
+    source = _gzip_csv(
+        "txn,dtts,amount,currency\n"
+        "T1,not-a-time,N/A,usd\n"
+        "T1,,N/A,usd\n"
+    )
+    checksum = _sha256(source)
+
+    frame = prepare_transaction_frame(
+        source_bytes=source,
+        source_file=_tx_names(d)[0],
+        source_checksum=checksum,
+        region="bkk",
+        batch_date=d,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert frame.loc[0, "amount"] == "N/A"
+    assert frame.loc[0, "dtts"] == "not-a-time"
+    assert frame.loc[1, "dtts"] == ""
+    assert frame.loc[0, "currency"] == "usd"
+    assert frame["source_row_number"].tolist() == [1, 2]
+    assert frame.loc[0, "source_row_id"] != frame.loc[1, "source_row_id"]
+    assert frame["batch_date"].tolist() == ["2025-07-22", "2025-07-22"]
+    assert frame["ingested_at"].tolist() == [
+        "2025-07-22T02:00:00Z",
+        "2025-07-22T02:00:00Z",
+    ]
