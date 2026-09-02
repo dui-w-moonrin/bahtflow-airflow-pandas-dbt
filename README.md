@@ -159,7 +159,7 @@ BAHTFLOW_RUNTIME_SERVICE_ACCOUNT=bahtflow-runtime@<project-id>.iam.gserviceaccou
 GOOGLE_ADC_HOST_PATH=C:/Users/<windows-user>/AppData/Roaming/gcloud/application_default_credentials.json
 ```
 
-Do not commit `.env` or the ADC file.
+Do not commit `.env` or the ADC file. The project must have active Cloud Billing and the Service Usage, IAM Service Account Credentials, and Cloud Storage APIs enabled before the live setup can complete.
 
 ### 2. Create the runtime service account and impersonation grant
 
@@ -211,14 +211,14 @@ Create the bucket if absent, or verify that an existing bucket uses the configur
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python scripts/bootstrap_gcs.py --create-if-missing
+  python -m scripts.bootstrap_gcs --create-if-missing
 ```
 
 For a pre-existing bucket, a non-creating check is available:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python scripts/bootstrap_gcs.py --check-only
+  python -m scripts.bootstrap_gcs --check-only
 ```
 
 After the bucket exists, grant only bucket-scoped object access to the runtime service account:
@@ -247,25 +247,36 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -c "import google.auth; c,p=google.auth.default(); print('project=', p); print('credential_type=', type(c).__name__)"
 ```
 
+The ADC metadata may not provide a project ID for impersonated credentials. The application still uses the explicit `BAHTFLOW_GCP_PROJECT` setting when it constructs the GCS client.
+
 ### 5. Run the bounded immutable-landing smoke test
 
 The smoke selection contains exactly one transaction file, one FX file, and both manifests:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python scripts/upload_landing_sources.py --smoke
+  python -m scripts.upload_landing_sources --smoke
 ```
 
 On a fresh bucket the first run reports `uploaded=4 skipped=0`. Run the same command again; the required idempotency evidence is `uploaded=0 skipped=4`.
 
-Verify one object can be listed, read back, and matched to its stored SHA-256 metadata:
+Run the repeatable live verifier. It reads a canonical manifest back from GCS, compares its bytes with the stored SHA-256 metadata, creates one disposable object outside the canonical landing prefixes, proves a changed source checksum is rejected, and deletes the disposable object again:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python -c "import hashlib; from pipeline.config import load_gcp_settings; from pipeline.gcs_adapter import GcsAdapter; from pipeline.gcs_landing import SOURCE_SHA256_METADATA_KEY; s=load_gcp_settings(); a=GcsAdapter(s.project_id); n='manifests/daily_source_manifest.csv'; m=a.get_object_metadata(s.bucket_name,n).metadata[SOURCE_SHA256_METADATA_KEY]; b=a.download_bytes(s.bucket_name,n); print('object=',n); print('checksum_match=',hashlib.sha256(b).hexdigest()==m); print('sha256_length=',len(m))"
+  python -m scripts.verify_gcs_live
 ```
 
-Expected non-secret evidence includes `checksum_match=True` and `sha256_length=64`.
+Expected non-secret evidence is:
+
+```text
+object=manifests/daily_source_manifest.csv
+readback_checksum_match=True
+conflict_detected=True
+disposable_cleanup=True
+```
+
+The verifier refuses to overwrite or delete `_smoke_conflict/disposable.txt` if that object already exists before the run.
 
 ### 6. Optional full-corpus landing
 
@@ -273,7 +284,7 @@ The default uploader processes the complete committed transaction/FX/manifest co
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
-  python scripts/upload_landing_sources.py
+  python -m scripts.upload_landing_sources
 ```
 
 This is not required merely to prove Feature 02 wiring; later features can use the full landing set when needed.
@@ -290,7 +301,8 @@ python -m py_compile `
   pipeline/gcs_adapter.py `
   pipeline/gcs_workflows.py `
   scripts/bootstrap_gcs.py `
-  scripts/upload_landing_sources.py
+  scripts/upload_landing_sources.py `
+  scripts/verify_gcs_live.py
 docker compose config --quiet
 ```
 
