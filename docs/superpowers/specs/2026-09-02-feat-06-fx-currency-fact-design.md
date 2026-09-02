@@ -8,32 +8,32 @@ Approved in chat on 2026-09-02.
 
 Feature 06 turns Feature 05 accepted transactions into an analytics fact by resolving the latest published FX snapshot at or before each logical batch date and converting every accepted transaction into THB, USD, and EUR amounts.
 
-The feature must preserve auditability and the v1 Pandas-first architecture:
+The feature preserves the v1 Pandas-first boundary:
 
-- Pandas owns FX validation, effective-date resolution, currency conversion, and derived fields.
-- BigQuery provides partition reads, append-only persistence, partition counts, and idempotency mechanics only.
-- No future FX rate, fallback constant, silent default, or SQL business transformation is allowed.
-- Every fact row retains the exact FX date and rates used for conversion.
+- Pandas owns FX validation, effective-date resolution, conversion, and derived fields.
+- BigQuery owns partition reads, append-only persistence, partition counts, and idempotency mechanics only.
+- No future FX, fallback constant, silent default, or SQL business transformation is allowed.
+- Every fact row retains the exact FX date and rates used.
 - Feature 05 remains the sole owner of transaction-quality quarantine decisions.
 
 ## Scope
 
 Feature 06 includes:
 
-1. Resolving one effective USD/EUR FX snapshot for a logical transaction batch date.
-2. Validating the selected raw FX snapshot.
-3. Converting accepted THB/USD/EUR transactions into all three currencies with `Decimal` arithmetic.
-4. Persisting one fact row per accepted transaction into BigQuery.
-5. Proving batch-local idempotency, partial-write recovery, and persisted count reconciliation.
-6. Live acceptance evidence for same-day and carry-forward FX behavior where the existing source corpus provides those cases.
+1. Resolve one effective USD/EUR FX snapshot for a logical batch date.
+2. Validate the selected raw FX snapshot.
+3. Convert accepted THB/USD/EUR transactions into all three currencies with `Decimal` arithmetic.
+4. Persist one fact row per accepted transaction.
+5. Prove batch-local idempotency, partial-write recovery, and persisted count reconciliation.
+6. Produce live acceptance evidence for the already-proven Feature 05 batch.
 
 Feature 06 does not include:
 
 - Airflow DAG wiring or historical backfill orchestration; Feature 07 owns that.
-- Marts, reporting rounding, public publishing, or recovery gates; Feature 08 owns those.
-- dbt, Spark, Kafka, streaming, or additional warehouse transformation layers.
-- A persisted `fx_effective_daily` table. Effective FX remains a Pandas runtime object in v1.
-- A second quarantine stage for accepted transactions.
+- Marts, report rounding, publication, or broader recovery gates; Feature 08 owns those.
+- dbt, Spark, Kafka, streaming, or additional transformation layers.
+- A persisted `fx_effective_daily` table.
+- A second transaction quarantine stage.
 
 ## Architecture Decision
 
@@ -72,7 +72,7 @@ bahtflow_analytics.fct_transactions
         partitioned by batch_date
 ```
 
-This keeps Feature 06 thin. It avoids an extra effective-FX warehouse table and keeps business logic out of BigQuery SQL.
+Feature 06 assumes the raw FX history required for the target date is already present in `bahtflow_raw.fx_rates`. Feature 07 owns orchestration/backfill guarantees around FX availability and logical-date ordering.
 
 ## Inputs
 
@@ -84,7 +84,7 @@ Read only the target partition from:
 bahtflow_analytics.transactions_accepted
 ```
 
-The Feature 05 accepted schema remains authoritative for source fields:
+Authoritative fields are:
 
 ```text
 txn
@@ -101,7 +101,7 @@ ingested_at
 classified_at
 ```
 
-Accepted transaction `amount` is BigQuery `NUMERIC`, represented as `Decimal` in Pandas/Python. Accepted currencies are canonical `THB`, `USD`, or `EUR`.
+`amount` is BigQuery `NUMERIC`, represented as `Decimal`. Currency is canonical `THB`, `USD`, or `EUR`.
 
 ### Raw FX
 
@@ -111,7 +111,7 @@ Read raw FX rows where:
 rate_date <= batch_date
 ```
 
-The raw FX contract remains:
+The raw contract is:
 
 ```text
 rate_date_raw
@@ -128,11 +128,9 @@ rate_date
 ingested_at
 ```
 
-`mid_rate` means THB per one unit of foreign currency.
+For v1 conversion semantics, `mid_rate` is THB per one unit of foreign currency. `rate_unit`, provider, URL, and raw-source lineage remain available in the raw table; the fact copies the effective date and numeric rates actually used.
 
 ## Effective FX Resolution
-
-### Selection rule
 
 For logical batch date `D`:
 
@@ -140,12 +138,12 @@ For logical batch date `D`:
 2. If no such rows exist, fail the batch.
 3. Determine the latest published `rate_date` present in those rows.
 4. Select only rows from that latest date.
-5. Validate that selected date as one complete snapshot.
-6. If the selected latest snapshot is malformed or incomplete, fail the batch. Do not silently fall back to an older valid date.
+5. Validate that date as one complete USD/EUR snapshot.
+6. If the latest published snapshot is malformed or incomplete, fail. Do not silently fall back to an older valid snapshot.
 
-This rule deliberately distinguishes "latest published snapshot" from "latest valid snapshot". A malformed newest publication is a source/reference-data defect and must remain visible.
+This intentionally means **latest published snapshot**, not **latest valid snapshot**.
 
-### Required snapshot shape
+### Required selected-snapshot shape
 
 The selected snapshot must contain exactly:
 
@@ -154,21 +152,20 @@ USD: exactly 1 row
 EUR: exactly 1 row
 ```
 
-The snapshot fails if:
+Fail if:
 
-- USD is missing.
-- EUR is missing.
-- either currency appears more than once.
-- another unsupported currency appears in the selected snapshot.
-- `rate_date_raw` is blank, unparseable, or does not equal canonical `rate_date`.
-- `mid_rate` is blank, non-numeric, non-finite, zero, negative, or outside BigQuery `NUMERIC` representability.
-- USD and EUR do not share the same canonical `rate_date`.
+- USD or EUR is missing;
+- either appears more than once;
+- an unsupported extra currency is present;
+- `rate_date_raw` is blank, unparseable, or differs from canonical `rate_date`;
+- `mid_rate` is blank, non-numeric, non-finite, zero, negative, or not BigQuery-`NUMERIC` representable;
+- the selected rows do not share the same canonical `rate_date`.
 
-The feature does not impose a maximum staleness threshold in v1.
+There is no maximum staleness threshold in v1.
 
-### Effective snapshot fields
+### Effective snapshot value
 
-The resolver returns one immutable runtime value with:
+The resolver returns:
 
 ```text
 fx_rate_date
@@ -185,62 +182,41 @@ is_carried_forward = fx_rate_date < batch_date
 staleness_days = (batch_date - fx_rate_date).days
 ```
 
-`staleness_days` must be an integer >= 0.
-
-A same-day rate has:
-
-```text
-is_carried_forward = false
-staleness_days = 0
-```
-
-A prior published rate has:
-
-```text
-is_carried_forward = true
-staleness_days > 0
-```
+`staleness_days` must be an integer >= 0. Same-day FX has `False/0`; prior FX has `True/>0`.
 
 ## Currency Conversion Semantics
 
-All money and FX arithmetic uses Python `Decimal`. `float` is not permitted in the conversion path.
+All money and FX arithmetic uses Python `Decimal`. `float` is forbidden in the conversion path.
 
-For an accepted transaction with original amount `A`:
+For accepted amount `A`:
 
 ```text
-if currency == THB:
-    amount_thb = A
-
-if currency == USD:
-    amount_thb = A * usd_thb_rate
-
-if currency == EUR:
-    amount_thb = A * eur_thb_rate
+THB: amount_thb = A
+USD: amount_thb = A * usd_thb_rate
+EUR: amount_thb = A * eur_thb_rate
 ```
 
-All three analytical amounts are then available through the THB bridge:
+Then:
 
 ```text
 amount_usd = amount_thb / usd_thb_rate
 amount_eur = amount_thb / eur_thb_rate
 ```
 
-No direct USD/EUR source cross-rate is required.
+No direct USD/EUR cross-rate is required.
 
 ### Precision policy
 
-The fact stores detailed values, not presentation-rounded two-decimal values.
+The fact stores detailed values rather than report-rounded two-decimal values.
 
-BigQuery `NUMERIC` supports at most 9 fractional decimal places. Every derived monetary value and stored FX rate must therefore be normalized deterministically to a BigQuery-`NUMERIC`-representable `Decimal` before persistence.
+Before persistence, every derived monetary value and stored FX rate must be normalized to a BigQuery-`NUMERIC`-representable `Decimal`:
 
-The persistence normalization policy is:
-
-- maximum scale: 9 fractional digits;
-- deterministic rounding: `ROUND_HALF_EVEN` when reduction to scale 9 is required;
+- maximum fractional scale: 9;
 - maximum integer digits: 29;
+- when scale reduction is required, use deterministic `ROUND_HALF_EVEN` to 9 fractional digits;
 - non-finite or non-representable results fail the batch.
 
-This normalization is a storage-representation rule, not business/reporting rounding. Feature 08 may round displayed mart metrics to two decimals where appropriate.
+This is storage normalization, not presentation rounding. Feature 08 may round mart/report output separately.
 
 ## Fact Table Contract
 
@@ -250,15 +226,9 @@ Create:
 bahtflow_analytics.fct_transactions
 ```
 
-partitioned by:
-
-```text
-batch_date
-```
+with DAY partitioning on `batch_date`.
 
 Each accepted transaction produces exactly one fact row.
-
-### Schema
 
 ```text
 txn                 STRING     REQUIRED
@@ -271,44 +241,35 @@ source_checksum     STRING     REQUIRED
 source_row_number   INTEGER    REQUIRED
 source_row_id       STRING     REQUIRED
 batch_date          DATE       REQUIRED
-ingested_at          TIMESTAMP  REQUIRED
+ingested_at         TIMESTAMP  REQUIRED
 classified_at       TIMESTAMP  REQUIRED
-
 amount_thb          NUMERIC    REQUIRED
 amount_usd          NUMERIC    REQUIRED
 amount_eur          NUMERIC    REQUIRED
-
 fx_rate_date        DATE       REQUIRED
 usd_thb_rate        NUMERIC    REQUIRED
 eur_thb_rate        NUMERIC    REQUIRED
 is_carried_forward  BOOLEAN    REQUIRED
 staleness_days      INTEGER    REQUIRED
-
 fact_created_at     TIMESTAMP  REQUIRED
 ```
 
-The original accepted `amount` and `currency` remain unchanged so the fact preserves the source transaction amount alongside converted analytical amounts.
+Original `amount` and `currency` remain unchanged alongside the converted analytical amounts.
 
 ## Idempotency
 
-Feature 06 reuses the stable Feature 04/05 source-row identity:
+Reuse `source_row_id` as the fact idempotency key.
 
-```text
-source_row_id
-```
-
-For one target batch partition:
+For one target partition:
 
 1. Read accepted rows for `batch_date = D`.
-2. Resolve one effective FX snapshot for `D`.
+2. Resolve the effective FX snapshot.
 3. Build the complete in-memory fact DataFrame.
 4. Query existing fact `source_row_id` values only for partition `D`.
-5. Pandas anti-filters already persisted fact rows.
-6. Append only unseen rows with `WRITE_APPEND`.
+5. Pandas anti-filters existing IDs.
+6. Append unseen rows with `WRITE_APPEND`.
 
-No `MERGE`, destructive replace, truncate, or delete is used in v1.
-
-Single-writer execution remains the v1 assumption.
+No `MERGE`, truncate, replace, or delete is used. Single-writer execution remains the v1 assumption.
 
 An unchanged rerun must report:
 
@@ -316,26 +277,29 @@ An unchanged rerun must report:
 fact_inserted_rows = 0
 ```
 
-while the persisted fact partition count remains unchanged.
+### Source/reference changes after persistence
+
+Feature 06 is append-only. It does not silently rewrite an already-persisted fact row if transformation rules or immutable source/reference inputs are later changed outside the v1 contract. Such a change requires an explicit rebuild/migration rather than an idempotent rerun.
 
 ## Partial-Write Recovery
 
-If a fact append succeeds partially at the workflow level and a later operation fails, retrying the same logical date must:
+If fact rows were persisted and a later workflow step fails, retrying the same logical date must:
 
-- rebuild the deterministic fact batch from accepted + effective FX;
-- query existing fact `source_row_id` values;
-- skip already persisted rows;
+- rebuild the deterministic fact batch;
+- query existing fact IDs;
+- skip already-persisted rows;
 - append only missing rows;
-- reconcile final partition counts.
+- reconcile the final partition count.
 
-Feature 06 does not roll back or delete already-written valid fact rows.
+Feature 06 does not roll back valid rows already written.
 
-## Reconciliation Invariants
+## Reconciliation
 
 Before persistence:
 
 ```text
 accepted_rows = generated_fact_rows
+accepted source_row_id set = generated fact source_row_id set
 ```
 
 After persistence:
@@ -344,84 +308,44 @@ After persistence:
 accepted_partition_rows = fact_partition_rows
 ```
 
-The stronger identity invariant is:
-
-```text
-accepted source_row_id set = fact source_row_id set
-```
-
-The implementation should verify count reconciliation on every run. Set equality is tested at the transformation/unit level and may be used in live acceptance evidence without requiring a separate permanent reconciliation table.
-
-Any persisted count mismatch fails the batch.
+Persisted count mismatch fails the batch. Set equality is mandatory in transformation tests and may also be inspected during live acceptance without creating a permanent reconciliation table.
 
 ## Failure Semantics
 
-Feature 06 fails the batch when reference data or conversion correctness is not sufficient to produce a complete trustworthy fact.
+Fail the batch when a complete trustworthy fact cannot be produced, including:
 
-Fail conditions include:
-
-- no FX rows at or before the batch date;
-- incomplete or malformed latest published USD/EUR snapshot;
+- no raw FX at or before the batch date;
+- malformed/incomplete latest published USD/EUR snapshot;
 - invalid, zero, negative, non-finite, or non-representable FX rate;
 - future FX would be required;
-- accepted transaction contains an impossible post-F05 state that prevents conversion;
-- derived converted amount cannot be represented safely as BigQuery `NUMERIC`;
-- generated fact row count differs from accepted row count;
+- an impossible post-F05 accepted transaction state prevents conversion;
+- a converted value is not BigQuery-`NUMERIC` representable;
+- generated fact count differs from accepted count;
 - persisted fact partition count differs from accepted partition count.
 
-These failures do not create new transaction quarantine records. Feature 05 owns transaction-quality classification; Feature 06 treats these cases as reference-data or transformation failures.
+These failures do not create new transaction quarantine rows. Feature 05 owns transaction-quality classification; Feature 06 treats them as reference-data or transformation failures.
 
 ## Component Boundaries
 
-The implementation should keep responsibilities narrow.
-
 ### FX resolution module
 
-Owns:
-
-- raw FX validation for the selected snapshot;
-- latest-prior publication selection;
-- `EffectiveFxSnapshot` creation;
-- no BigQuery persistence.
+Owns raw FX selection/validation and `EffectiveFxSnapshot`. It performs no persistence.
 
 ### Currency fact transformation module
 
-Owns:
-
-- accepted transaction validation assumptions needed for conversion;
-- Decimal conversion formulas;
-- BigQuery NUMERIC normalization;
-- fact DataFrame projection;
-- in-memory row-count reconciliation.
+Owns Decimal formulas, NUMERIC normalization, fact projection, source-row identity preservation, and in-memory reconciliation.
 
 ### Fact load orchestration module
 
-Owns:
-
-- target-partition reads;
-- raw FX history read for `rate_date <= batch_date`;
-- fact anti-filtering;
-- append-only write;
-- persisted row-count reconciliation;
-- run summary.
+Owns target-partition reads, raw FX history read, anti-filtering, append-only fact write, persisted count reconciliation, and run summary.
 
 ### BigQuery contract/adapter extensions
 
-Own only warehouse mechanics needed by the above modules:
-
-- fact schema/bootstrap;
-- querying FX rows up to a target date;
-- existing `source_row_id` lookup;
-- append rows;
-- partition counts.
-
-BigQuery SQL must not implement effective FX resolution or currency-conversion business rules.
+Own fact schema/bootstrap and narrow warehouse mechanics needed by the modules above. BigQuery SQL must not resolve effective FX or perform currency conversion.
 
 ## CLI and Bootstrap
 
-Provide a narrow bootstrap command for the fact table and a one-batch execution command, following existing Feature 05 script conventions.
-
-Expected execution shape:
+Follow existing Feature 05 script conventions:
 
 ```powershell
 docker compose --profile gcp run --rm gcp-toolbox `
@@ -431,7 +355,7 @@ docker compose --profile gcp run --rm gcp-toolbox `
   python -m scripts.build_currency_fact --batch-date 2025-07-22
 ```
 
-The one-batch CLI summary should expose at least:
+The one-batch summary exposes at least:
 
 ```text
 batch_date
@@ -445,53 +369,51 @@ fact_partition_rows
 reconciled
 ```
 
-Exact live rates and derived amount values must be measured from the source corpus rather than documented as guessed constants.
+Exact live rates and converted values are measured from the corpus, never guessed in documentation.
 
 ## Testing Strategy
 
-### FX resolver unit tests
+### FX resolver
 
 Cover:
 
-- same-day FX resolves with `is_carried_forward=False` and staleness 0;
-- earlier FX resolves with `is_carried_forward=True` and positive staleness;
-- future FX is never selected;
+- same-day FX => carry-forward false, staleness 0;
+- prior FX => carry-forward true, positive staleness;
+- future FX never selected;
 - no prior publication fails;
-- latest publication missing USD fails;
-- latest publication missing EUR fails;
-- duplicate USD or EUR fails;
-- unsupported extra currency in selected snapshot fails;
-- blank/non-numeric/non-finite/zero/negative rate fails;
+- missing USD/EUR fails;
+- duplicate USD/EUR fails;
+- unsupported extra currency fails;
+- invalid/non-finite/zero/negative rate fails;
 - `rate_date_raw` mismatch fails;
-- malformed latest publication does not silently fall back to an older valid date.
+- malformed latest publication does not fall back to an older valid date.
 
-### Conversion unit tests
+### Conversion
 
 Cover:
 
 - THB identity conversion;
-- USD to THB, USD, and EUR;
-- EUR to THB, USD, and EUR;
+- USD and EUR conversion to all three output currencies;
 - Decimal-only arithmetic;
 - deterministic scale-9 normalization;
-- integer/scale overflow failure;
-- original accepted amount/currency preserved;
-- generated fact row count equals accepted row count;
-- source-row identity preserved exactly.
+- NUMERIC overflow failure;
+- original amount/currency preserved;
+- fact count equals accepted count;
+- source-row identity set preserved exactly.
 
-### Persistence tests
+### Persistence
 
 Cover:
 
-- first run writes unseen fact rows;
-- unchanged rerun inserts zero rows;
-- partial-write retry appends only missing fact rows;
+- first run writes unseen rows;
+- unchanged rerun inserts zero;
+- partial-write retry appends only missing rows;
 - persisted count mismatch fails;
 - fact bootstrap is create/verify rerun-safe.
 
 ## Live Acceptance
 
-Use the already-proven Feature 05 batch `2025-07-22` as the primary Feature 06 acceptance date.
+Use the already-proven Feature 05 batch `2025-07-22` as the primary acceptance date.
 
 Feature 05 established:
 
@@ -499,20 +421,20 @@ Feature 05 established:
 accepted_rows = 8803
 ```
 
-Feature 06 must measure and prove for that same batch:
+Feature 06 must prove:
 
 ```text
 fact_rows = 8803
 accepted_partition_rows = fact_partition_rows
 ```
 
-The first live run must insert the measured fact rows. The unchanged rerun must report:
+The first live run inserts the measured fact rows. The unchanged rerun must report:
 
 ```text
 fact_inserted_rows = 0
 ```
 
-Live evidence must inspect at least one THB, one USD, and one EUR transaction and show:
+Inspect at least one THB, one USD, and one EUR fact row and show:
 
 ```text
 original amount/currency
@@ -526,28 +448,28 @@ is_carried_forward
 staleness_days
 ```
 
-To prove carry-forward behavior, select an existing transaction batch date from the source corpus that has no same-day FX publication but does have a prior published complete USD/EUR snapshot. Do not fabricate a new production acceptance source case solely for the demonstration. If the corpus unexpectedly contains no such batch, unit-test evidence remains the fallback proof.
+Carry-forward behavior is mandatory in unit tests. A second live carry-forward demonstration is optional in Feature 06: use it only if the current raw/accepted acceptance state already contains a suitable logical date. Otherwise Feature 07 backfill is the natural place to demonstrate historical carry-forward end to end.
 
 ## Acceptance Criteria
 
-Feature 06 is complete only when all of the following are evidenced:
+Feature 06 is complete only when evidence shows:
 
-1. The fact table exists with the exact schema and `batch_date` DAY partitioning.
-2. The FX resolver never uses a future rate.
-3. The latest published prior/same-day FX snapshot is validated as an exact USD/EUR pair.
-4. Invalid latest FX publication fails rather than silently falling back.
-5. THB/USD/EUR conversion uses `Decimal` and stores BigQuery-`NUMERIC`-representable values.
-6. Every fact row contains FX rate/date/staleness lineage.
-7. One accepted transaction produces one fact row.
-8. Primary live acceptance for `2025-07-22` proves `8803` accepted rows and `8803` fact rows.
+1. The fact table has the exact schema and DAY partition on `batch_date`.
+2. The resolver never uses future FX.
+3. The latest published prior/same-day snapshot is validated as an exact USD/EUR pair.
+4. An invalid latest publication fails rather than falling back.
+5. Conversion uses `Decimal` and BigQuery-`NUMERIC`-representable values.
+6. Every fact row contains effective FX date/rates/staleness lineage.
+7. One accepted row produces one fact row with the same `source_row_id`.
+8. Primary live acceptance for `2025-07-22` proves 8,803 accepted and 8,803 fact rows.
 9. An unchanged rerun inserts zero fact rows.
-10. Partial-write retry behavior is proven by tests.
+10. Partial-write retry is proven by tests.
 11. Persisted count mismatch fails.
 12. No business conversion logic is implemented in BigQuery SQL.
-13. No Feature 07 Airflow orchestration or Feature 08 mart scope creeps into this feature.
+13. No Feature 07 Airflow or Feature 08 mart scope creeps into Feature 06.
 
 ## Deferred Work
 
-Feature 07 will wrap the proven Feature 04-06 Python functions into the Airflow logical-date path and backfill flow.
+Feature 07 wraps the proven Feature 04-06 Python functions into the Airflow logical-date/backfill path and guarantees the FX availability/order needed by historical runs.
 
-Feature 08 will add marts, broader reconciliation, publication gating, and recovery demonstrations. Presentation rounding belongs there rather than in this fact.
+Feature 08 adds marts, broader reconciliation, publication gating, recovery demonstrations, and presentation rounding.
