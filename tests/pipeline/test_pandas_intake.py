@@ -4,12 +4,15 @@ import gzip
 import hashlib
 from datetime import date, datetime, timezone
 
+import pandas as pd
 import pytest
 
 from pipeline.pandas_intake import (
     EXPECTED_REGIONS,
     PandasIntakeError,
+    anti_filter_existing,
     make_source_row_id,
+    prepare_fx_frame,
     prepare_transaction_frame,
     same_day_fx_object_name,
     transaction_prefix,
@@ -154,3 +157,77 @@ def test_transaction_frame_preserves_dirty_strings_and_metadata():
         "2025-07-22T02:00:00Z",
         "2025-07-22T02:00:00Z",
     ]
+
+
+def test_fx_frame_enforces_exact_header():
+    d = date(2025, 7, 22)
+    source = (
+        "rate_date,currency,wrong,rate_unit,source_provider,source_url\n"
+        "2025-07-22,USD,32.10,THB_PER_FCY,BOT,https://example.test\n"
+    ).encode("utf-8")
+
+    with pytest.raises(PandasIntakeError, match="FX header mismatch"):
+        prepare_fx_frame(
+            source_bytes=source,
+            source_file=same_day_fx_object_name(d),
+            source_checksum=_sha256(source),
+            rate_date=d,
+            ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+        )
+
+
+def test_fx_frame_preserves_raw_rate_date_and_adds_metadata():
+    d = date(2025, 7, 22)
+    source = (
+        "rate_date,currency,mid_rate,rate_unit,source_provider,source_url\n"
+        "2025-07-22,EUR,37.40,THB_PER_FCY,BOT,https://example.test/eur\n"
+        "2025-07-22,USD,32.10,THB_PER_FCY,BOT,https://example.test/usd\n"
+    ).encode("utf-8")
+    checksum = _sha256(source)
+
+    frame = prepare_fx_frame(
+        source_bytes=source,
+        source_file=same_day_fx_object_name(d),
+        source_checksum=checksum,
+        rate_date=d,
+        ingested_at=datetime(2025, 7, 22, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert frame["rate_date_raw"].tolist() == ["2025-07-22", "2025-07-22"]
+    assert frame["currency"].tolist() == ["EUR", "USD"]
+    assert frame["mid_rate"].tolist() == ["37.40", "32.10"]
+    assert frame["source_row_number"].tolist() == [1, 2]
+    assert frame["rate_date"].tolist() == ["2025-07-22", "2025-07-22"]
+    assert frame["ingested_at"].tolist() == [
+        "2025-07-22T02:00:00Z",
+        "2025-07-22T02:00:00Z",
+    ]
+
+
+def test_anti_filter_existing_removes_only_already_loaded_source_rows():
+    frame = pd.DataFrame(
+        {
+            "source_row_id": ["row-1", "row-2", "row-3"],
+            "amount": ["10", "20", "30"],
+        }
+    )
+
+    result = anti_filter_existing(frame, {"row-1", "row-3"})
+
+    assert result["source_row_id"].tolist() == ["row-2"]
+    assert result["amount"].tolist() == ["20"]
+    assert result.index.tolist() == [0]
+
+
+def test_anti_filter_existing_with_all_ids_returns_empty_same_columns():
+    frame = pd.DataFrame(
+        {
+            "source_row_id": ["row-1", "row-2"],
+            "amount": ["10", "20"],
+        }
+    )
+
+    result = anti_filter_existing(frame, {"row-1", "row-2"})
+
+    assert result.empty
+    assert result.columns.tolist() == ["source_row_id", "amount"]
