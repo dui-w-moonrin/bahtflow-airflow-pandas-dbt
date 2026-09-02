@@ -57,10 +57,12 @@ class BigQueryAdapter:
             raise BigQueryContractError(f"Table schema mismatch for {full_id}")
 
         actual_partition = getattr(existing.time_partitioning, "field", None)
-        if actual_partition != partition_field:
+        actual_partition_type = getattr(existing.time_partitioning, "type_", None)
+        if actual_partition != partition_field or actual_partition_type != "DAY":
             raise BigQueryContractError(
                 f"Table partition mismatch for {full_id}: "
-                f"expected={partition_field} actual={actual_partition}"
+                f"expected=DAY:{partition_field} "
+                f"actual={actual_partition_type}:{actual_partition}"
             )
         return "verified"
 
